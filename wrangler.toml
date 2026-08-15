@@ -1,0 +1,53 @@
+# wrangler.toml — Telegram RSS Feed Reader Bot
+# Docs: https://developers.cloudflare.com/workers/wrangler/configuration/
+
+name = "telegram-rss-bot"
+main = "src/index.ts"
+compatibility_date = "2024-11-01"
+
+# ---------------------------------------------------------------------------
+# Cron trigger: poll all RSS feeds every 15 minutes.
+# Adjust the schedule as needed. Format: min hour day month weekday (UTC).
+#   "*/15 * * * *"  -> every 15 minutes
+#   "*/30 * * * *"  -> every 30 minutes
+# ---------------------------------------------------------------------------
+[triggers]
+crons = ["*/15 * * * *"]
+
+# ---------------------------------------------------------------------------
+# KV namespaces. Create each one with `wrangler kv namespace create <NAME>`
+# and paste the returned `id` here (see README for exact steps).
+# ---------------------------------------------------------------------------
+[[kv_namespaces]]
+binding = "RSS_FEEDS"      # list of RSS feed URLs + metadata
+id = "a12457813d514ea6a431f408bbfbf6be"
+
+[[kv_namespaces]]
+binding = "RSS_SEEN"       # processed article GUIDs/URLs (with TTL)
+id = "77694ed334424e84a443296e8e3763b9"
+
+[[kv_namespaces]]
+binding = "RSS_SETTINGS"   # authorized admin IDs + misc state
+id = "b8b45685f8334f0ab3eb19c06a95313a"
+
+# ---------------------------------------------------------------------------
+# Environment variables.
+#
+# Public (non-secret) vars can be set here under [vars].
+# Secrets MUST be set with `wrangler secret put <NAME>` (never hardcode them):
+#
+#   TELEGRAM_BOT_TOKEN  -> your bot token from @BotFather
+#   ADMIN_USER_ID       -> comma-separated authorized admin user ID(s)
+#   WEBHOOK_SECRET      -> random string used as the Telegram webhook secret token
+#   DEFAULT_CHAT_ID     -> (optional) channel/group/chat to post articles to;
+#                          defaults to the first ADMIN_USER_ID
+#
+# Optionally set these public vars:
+#   FETCH_OG_IMAGE      -> set to "false" to DISABLE the webpage og:image fallback
+#                          (on by default when a feed provides no image)
+# ---------------------------------------------------------------------------
+[vars]
+# Uncomment and set if you want article cards posted to a fixed chat/channel.
+# DEFAULT_CHAT_ID = "123456789"
+# Disable the webpage image fallback (saves one fetch per image-less article).
+# FETCH_OG_IMAGE = "false"
