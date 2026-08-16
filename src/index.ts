@@ -202,6 +202,10 @@ export function isImageUrl(url: string): boolean {
 export function extractImageFromFeed(raw: any): string | null {
   if (!raw) return null;
 
+  // 0. RSS item-level <image><url>...</url></image> (e.g. digiato.com)
+  const itemImage = textOf(raw.image?.url);
+  if (itemImage) return decodeEntities(itemImage);
+
   // 1. <media:content medium="image" url="...">
   const media = asArray(raw["media:content"] ?? raw.media?.content ?? raw.mediaContent);
   for (const m of media) {
@@ -438,7 +442,12 @@ export function normalizeUrl(input: string): string {
 
 /** Stable, dedupe-safe identifier for an article. */
 export function canonicalId(rawId: string): string {
-  const t = rawId.trim();
+  // XML/HTML numeric refs (e.g. WordPress `&#038;` = `&`) can leak into GUIDs
+  // because fast-xml-parser only decodes a subset in text nodes. Decode them
+  // first, otherwise `normalizeUrl` would treat the `#` in `&#038;` as a
+  // fragment delimiter and drop the query params (e.g. the post id), collapsing
+  // every article in a feed to the same dedupe key.
+  const t = decodeEntities(rawId.trim());
   return /^https?:\/\//i.test(t) ? normalizeUrl(t) : t;
 }
 

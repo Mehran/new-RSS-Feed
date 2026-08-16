@@ -54,6 +54,11 @@ const RSS_WITH_IMAGES = `<?xml version="1.0" encoding="UTF-8"?>
 </rss>`;
 
 describe("extractImageFromFeed", () => {
+  it("picks RSS item-level <image><url> (digiato format)", () => {
+    expect(extractImageFromFeed({ image: { url: "https://cdn.example.com/item.jpg.webp" } }))
+      .toBe("https://cdn.example.com/item.jpg.webp");
+  });
+
   it("picks <media:content medium=\"image\">", () => {
     expect(extractImageFromFeed({ "media:content": { "@_url": "https://cdn.example.com/m.jpg", "@_medium": "image" } }))
       .toBe("https://cdn.example.com/m.jpg");

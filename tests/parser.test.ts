@@ -188,4 +188,14 @@ describe("normalizeUrl / canonicalId", () => {
     expect(canonicalId("https://example.com/a?utm_source=x")).toBe("https://example.com/a");
     expect(canonicalId("guid-123")).toBe("guid-123");
   });
+
+  it("decodes XML numeric entities before normalizing (WordPress &#038; GUIDs)", () => {
+    // `&#038;` is a numeric ref for `&`. If left un-decoded, the `#` would be
+    // treated as a fragment delimiter and the post id (`p=...`) would be dropped,
+    // collapsing every digiato article to the same dedupe key.
+    expect(canonicalId("https://digiato.com/?post_type=digi_posts&#038;p=1959142"))
+      .toBe("https://digiato.com/?post_type=digi_posts&p=1959142");
+    expect(canonicalId("https://digiato.com/?post_type=digi_posts&#038;p=1958953"))
+      .toBe("https://digiato.com/?post_type=digi_posts&p=1958953");
+  });
 });
