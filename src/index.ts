@@ -251,16 +251,26 @@ const TRACKING_PIXEL_RE =
   /(?:1x1|pixel|track(?:ing)?|beacon|blank|spacer|transparent|clear)[^/]*\.(?:gif|png)(?:\?|#|$)/i;
 
 /**
- * Some image CDNs serve fast, pre-generated "-WxH" thumbnails but stream their
- * full-size originals extremely slowly (digiato's Iranian S3-backed CDN does
- * this — the full JPEG can take minutes, the -800x800 thumbnail ~1s). Rewrite
- * such URLs to a modest thumbnail so we can download + re-upload them reliably.
+ * Candidate URLs to try when downloading an image ourselves. Some CDNs
+ * (digiato) stream full-size JPEG originals very slowly but serve fast,
+ * pre-generated "-WxH" thumbnails. Which sizes exist varies per image (a small
+ * source has no "-800x800"), so we try several, largest first, then the
+ * original as a final fallback.
  */
-function toThumbnailUrl(u: string): string {
-  if (!/static\.digiato\.com/i.test(u)) return u;
-  // Already a sized variant — don't double-suffix.
-  if (/-\d+x\d+\.(?:jpe?g|png|gif)(?:\?|#|$)/i.test(u)) return u;
-  return u.replace(/\.(jpe?g|png|gif)(?:\?|#|$)/i, "-800x800.$1");
+export function imageCandidates(url: string): string[] {
+  if (!/static\.digiato\.com/i.test(url)) return [url];
+  // Already a sized variant — don't add another suffix.
+  if (/-\d+x\d+\.(?:jpe?g|png|gif)(?:\?|#|$)/i.test(url)) return [url];
+  const sized = (size: string) =>
+    url.replace(/\.(jpe?g|png|gif)(?:\?|#|$)/i, `-${size}.$1`);
+  return [
+    sized("800x800"),
+    sized("480x316"),
+    sized("350x350"),
+    sized("248x248"),
+    sized("150x150"),
+    url, // full-size original as the final fallback
+  ];
 }
 
 /**
@@ -287,8 +297,6 @@ export function cleanupImageUrl(url: string, baseUrl?: string): string | null {
   // sendPhoto rejects WebP, but the original "photo.jpg" (JPEG/PNG/GIF) is
   // usually served at the same URL without the trailing ".webp".
   u = u.replace(/\.(jpe?g|png|gif|bmp|tiff?)\.webp$/i, ".$1");
-  // Prefer a fast thumbnail for hosts whose full-size images are too slow.
-  u = toThumbnailUrl(u);
   return u;
 }
 
@@ -535,12 +543,8 @@ export function imageExtension(url: string): string {
   return m ? m[1].toLowerCase() : "jpg";
 }
 
-/**
- * Download an image ourselves (browser UA). Needed when a host's image CDN
- * throttles or blocks Telegram's own fetcher (e.g. digiato's static CDN).
- * Returns the raw bytes, or null on any failure/timeout.
- */
-export async function fetchImageBytes(url: string): Promise<ArrayBuffer | null> {
+/** Fetch a single image URL (browser UA) and return its bytes, or null. */
+async function fetchImageOnce(url: string): Promise<ArrayBuffer | null> {
   if (!url) return null;
   try {
     const res = await fetch(url, {
@@ -561,6 +565,19 @@ export async function fetchImageBytes(url: string): Promise<ArrayBuffer | null> 
   } catch {
     return null;
   }
+}
+
+/**
+ * Download an image ourselves (browser UA), trying thumbnail candidates first.
+ * Needed when a host's image CDN throttles or blocks Telegram's own fetcher
+ * (e.g. digiato's static CDN). Returns the raw bytes, or null on total failure.
+ */
+export async function fetchImageBytes(url: string): Promise<ArrayBuffer | null> {
+  for (const candidate of imageCandidates(url)) {
+    const bytes = await fetchImageOnce(candidate);
+    if (bytes) return bytes;
+  }
+  return null;
 }
 
 /** Upload raw image bytes to Telegram as a photo (multipart/form-data). */

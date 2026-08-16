@@ -8,6 +8,7 @@ import {
   extractMetaImage,
   cleanupImageUrl,
   resolveArticleImage,
+  imageCandidates,
   imageExtension,
   fetchImageBytes,
   sendPhotoUpload,
@@ -229,16 +230,31 @@ describe("cleanupImageUrl", () => {
     expect(cleanupImageUrl("https://x.com/a.webp")).toBe("https://x.com/a.webp");
   });
 
-  it("rewrites digiato full-size images to a fast -800x800 thumbnail", () => {
+  it("leaves digiato URLs as full-size after .webp strip (size chosen at download)", () => {
     expect(cleanupImageUrl("https://static.digiato.com/digiato/2026/08/Worn-out-cars-2.jpg.webp"))
-      .toBe("https://static.digiato.com/digiato/2026/08/Worn-out-cars-2-800x800.jpg");
-    expect(cleanupImageUrl("https://static.digiato.com/digiato/2026/08/Worn-out-cars-2.jpg"))
-      .toBe("https://static.digiato.com/digiato/2026/08/Worn-out-cars-2-800x800.jpg");
-    // already-sized variants are left alone
-    expect(cleanupImageUrl("https://static.digiato.com/digiato/2026/08/Worn-out-cars-2-480x316.jpg"))
-      .toBe("https://static.digiato.com/digiato/2026/08/Worn-out-cars-2-480x316.jpg");
-    // other hosts are not rewritten
-    expect(cleanupImageUrl("https://cdn.example.com/a.jpg.webp")).toBe("https://cdn.example.com/a.jpg");
+      .toBe("https://static.digiato.com/digiato/2026/08/Worn-out-cars-2.jpg");
+  });
+});
+
+describe("imageCandidates", () => {
+  it("returns the URL unchanged for non-digiato hosts", () => {
+    expect(imageCandidates("https://cdn.example.com/a.jpg")).toEqual(["https://cdn.example.com/a.jpg"]);
+  });
+
+  it("tries several digiato thumbnails, largest first, then the original", () => {
+    expect(imageCandidates("https://static.digiato.com/digiato/2026/08/mizito-1.jpg")).toEqual([
+      "https://static.digiato.com/digiato/2026/08/mizito-1-800x800.jpg",
+      "https://static.digiato.com/digiato/2026/08/mizito-1-480x316.jpg",
+      "https://static.digiato.com/digiato/2026/08/mizito-1-350x350.jpg",
+      "https://static.digiato.com/digiato/2026/08/mizito-1-248x248.jpg",
+      "https://static.digiato.com/digiato/2026/08/mizito-1-150x150.jpg",
+      "https://static.digiato.com/digiato/2026/08/mizito-1.jpg",
+    ]);
+  });
+
+  it("does not double-suffix an already-sized URL", () => {
+    expect(imageCandidates("https://static.digiato.com/digiato/2026/08/mizito-1-480x316.jpg"))
+      .toEqual(["https://static.digiato.com/digiato/2026/08/mizito-1-480x316.jpg"]);
   });
 });
 
@@ -287,6 +303,20 @@ describe("fetchImageBytes", () => {
   it("returns null when the fetch rejects", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => { throw new Error("boom"); }));
     expect(await fetchImageBytes("https://x.com/a.jpg")).toBeNull();
+  });
+
+  it("tries thumbnail candidates and returns the first that downloads", async () => {
+    const fetchSpy = vi.fn(async (url: string) => {
+      if (String(url).includes("-800x800")) return new Response(null, { status: 404 });
+      if (String(url).includes("-480x316")) {
+        return new Response(new Uint8Array([9, 9]), { headers: { "content-type": "image/jpeg" } });
+      }
+      throw new Error("unexpected url " + url);
+    });
+    vi.stubGlobal("fetch", fetchSpy);
+    const got = await fetchImageBytes("https://static.digiato.com/digiato/2026/08/mizito-1.jpg");
+    expect([...new Uint8Array(got!)]).toEqual([9, 9]);
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
   });
 });
 
