@@ -8,6 +8,9 @@ import {
   extractMetaImage,
   cleanupImageUrl,
   resolveArticleImage,
+  imageExtension,
+  fetchImageBytes,
+  sendPhotoUpload,
   stripHtml,
   decodeEntities,
   escapeHtml,
@@ -217,6 +220,102 @@ describe("cleanupImageUrl", () => {
     expect(cleanupImageUrl("https://example.com/1x1.gif")).toBeNull();
     expect(cleanupImageUrl("https://example.com/tracking.gif")).toBeNull();
     expect(cleanupImageUrl("https://example.com/photo.gif")).toBe("https://example.com/photo.gif");
+  });
+
+  it("strips a trailing .webp to reveal the underlying image", () => {
+    expect(cleanupImageUrl("https://x.com/a.jpeg.webp")).toBe("https://x.com/a.jpeg");
+    expect(cleanupImageUrl("https://x.com/a.png.webp")).toBe("https://x.com/a.png");
+    // a genuine .webp (no underlying extension) is left untouched
+    expect(cleanupImageUrl("https://x.com/a.webp")).toBe("https://x.com/a.webp");
+  });
+
+  it("rewrites digiato full-size images to a fast -800x800 thumbnail", () => {
+    expect(cleanupImageUrl("https://static.digiato.com/digiato/2026/08/Worn-out-cars-2.jpg.webp"))
+      .toBe("https://static.digiato.com/digiato/2026/08/Worn-out-cars-2-800x800.jpg");
+    expect(cleanupImageUrl("https://static.digiato.com/digiato/2026/08/Worn-out-cars-2.jpg"))
+      .toBe("https://static.digiato.com/digiato/2026/08/Worn-out-cars-2-800x800.jpg");
+    // already-sized variants are left alone
+    expect(cleanupImageUrl("https://static.digiato.com/digiato/2026/08/Worn-out-cars-2-480x316.jpg"))
+      .toBe("https://static.digiato.com/digiato/2026/08/Worn-out-cars-2-480x316.jpg");
+    // other hosts are not rewritten
+    expect(cleanupImageUrl("https://cdn.example.com/a.jpg.webp")).toBe("https://cdn.example.com/a.jpg");
+  });
+});
+
+describe("imageExtension", () => {
+  it("derives the image file extension from a URL", () => {
+    expect(imageExtension("https://x.com/a.jpg")).toBe("jpg");
+    expect(imageExtension("https://x.com/a.jpeg?w=1")).toBe("jpeg");
+    expect(imageExtension("https://x.com/a.png")).toBe("png");
+    expect(imageExtension("https://x.com/a.gif#f")).toBe("gif");
+    expect(imageExtension("https://x.com/noext")).toBe("jpg");
+  });
+});
+
+describe("fetchImageBytes", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("downloads image bytes and returns an ArrayBuffer", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response(new Uint8Array([0xff, 0xd8, 0xff, 0xe0]), {
+        headers: { "content-type": "image/jpeg" },
+      })),
+    );
+    const got = await fetchImageBytes("https://x.com/a.jpg");
+    expect(got).toBeInstanceOf(ArrayBuffer);
+    expect([...new Uint8Array(got!)]).toEqual([0xff, 0xd8, 0xff, 0xe0]);
+  });
+
+  it("returns null for non-image responses", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response("not an image", { headers: { "content-type": "text/html" } })),
+    );
+    expect(await fetchImageBytes("https://x.com/a.jpg")).toBeNull();
+  });
+
+  it("returns null for oversized images", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => ({
+      ok: true,
+      headers: { get: (k: string) => (k === "content-type" ? "image/jpeg" : "6000000") },
+      arrayBuffer: async () => new ArrayBuffer(0),
+    })));
+    expect(await fetchImageBytes("https://x.com/a.jpg")).toBeNull();
+  });
+
+  it("returns null when the fetch rejects", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => { throw new Error("boom"); }));
+    expect(await fetchImageBytes("https://x.com/a.jpg")).toBeNull();
+  });
+});
+
+describe("sendPhotoUpload", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("POSTs multipart/form-data and returns the result", async () => {
+    const fetchSpy = vi.fn(async () => new Response(JSON.stringify({ ok: true, result: { message_id: 1 } }), {
+      headers: { "content-type": "application/json" },
+    }));
+    vi.stubGlobal("fetch", fetchSpy);
+    const env = { TELEGRAM_BOT_TOKEN: "TOKEN" } as any;
+    const result = await sendPhotoUpload(env, 123, "https://x.com/a.jpg", new Uint8Array([1, 2, 3]).buffer, "<b>hi</b>");
+    expect(result).toEqual({ message_id: 1 });
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    const [url, opts] = fetchSpy.mock.calls[0] as any;
+    expect(url).toBe("https://api.telegram.org/botTOKEN/sendPhoto");
+    expect(opts.method).toBe("POST");
+    expect(opts.body).toBeInstanceOf(FormData);
+  });
+
+  it("throws on a Telegram error response", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ ok: false, description: "bad" }), {
+      status: 400,
+      headers: { "content-type": "application/json" },
+    })));
+    const env = { TELEGRAM_BOT_TOKEN: "TOKEN" } as any;
+    await expect(sendPhotoUpload(env, 123, "https://x.com/a.jpg", new ArrayBuffer(0), "c"))
+      .rejects.toThrow(/bad/);
   });
 });
 

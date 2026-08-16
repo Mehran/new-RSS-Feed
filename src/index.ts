@@ -251,6 +251,19 @@ const TRACKING_PIXEL_RE =
   /(?:1x1|pixel|track(?:ing)?|beacon|blank|spacer|transparent|clear)[^/]*\.(?:gif|png)(?:\?|#|$)/i;
 
 /**
+ * Some image CDNs serve fast, pre-generated "-WxH" thumbnails but stream their
+ * full-size originals extremely slowly (digiato's Iranian S3-backed CDN does
+ * this — the full JPEG can take minutes, the -800x800 thumbnail ~1s). Rewrite
+ * such URLs to a modest thumbnail so we can download + re-upload them reliably.
+ */
+function toThumbnailUrl(u: string): string {
+  if (!/static\.digiato\.com/i.test(u)) return u;
+  // Already a sized variant — don't double-suffix.
+  if (/-\d+x\d+\.(?:jpe?g|png|gif)(?:\?|#|$)/i.test(u)) return u;
+  return u.replace(/\.(jpe?g|png|gif)(?:\?|#|$)/i, "-800x800.$1");
+}
+
+/**
  * Clean an extracted image URL: decode entities, absolutize protocol-relative
  * and relative URLs, drop non-http schemes and obvious tracking pixels.
  * Returns null when the URL can't be made usable.
@@ -270,6 +283,12 @@ export function cleanupImageUrl(url: string, baseUrl?: string): string | null {
   }
   if (!/^https?:\/\//i.test(u)) return null;
   if (TRACKING_PIXEL_RE.test(u)) return null;
+  // Some sites publish a WebP-optimized copy as "photo.jpg.webp". Telegram's
+  // sendPhoto rejects WebP, but the original "photo.jpg" (JPEG/PNG/GIF) is
+  // usually served at the same URL without the trailing ".webp".
+  u = u.replace(/\.(jpe?g|png|gif|bmp|tiff?)\.webp$/i, ".$1");
+  // Prefer a fast thumbnail for hosts whose full-size images are too slow.
+  u = toThumbnailUrl(u);
   return u;
 }
 
@@ -510,6 +529,69 @@ function sendPhoto(
   });
 }
 
+/** File extension of an image URL (for the multipart filename). */
+export function imageExtension(url: string): string {
+  const m = url.match(/\.(jpe?g|png|gif|webp|bmp)(?:\?|#|$)/i);
+  return m ? m[1].toLowerCase() : "jpg";
+}
+
+/**
+ * Download an image ourselves (browser UA). Needed when a host's image CDN
+ * throttles or blocks Telegram's own fetcher (e.g. digiato's static CDN).
+ * Returns the raw bytes, or null on any failure/timeout.
+ */
+export async function fetchImageBytes(url: string): Promise<ArrayBuffer | null> {
+  if (!url) return null;
+  try {
+    const res = await fetch(url, {
+      headers: {
+        "User-Agent": PAGE_UA,
+        Accept: "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+      },
+      redirect: "follow",
+      signal: AbortSignal.timeout(20_000),
+    });
+    if (!res.ok) return null;
+    const type = (res.headers.get("content-type") ?? "").toLowerCase();
+    if (!type.startsWith("image/")) return null;
+    const len = Number(res.headers.get("content-length") ?? "0");
+    if (len > 5_000_000) return null; // Telegram photo cap is 10 MB; keep margin
+    return await res.arrayBuffer();
+  } catch {
+    return null;
+  }
+}
+
+/** Upload raw image bytes to Telegram as a photo (multipart/form-data). */
+export async function sendPhotoUpload(
+  env: Env,
+  chatId: number,
+  photoUrl: string,
+  imageBytes: ArrayBuffer,
+  caption: string,
+  replyMarkup?: Record<string, unknown>,
+): Promise<any> {
+  const ext = imageExtension(photoUrl);
+  const mime =
+    ext === "png" ? "image/png" : ext === "gif" ? "image/gif" : ext === "webp" ? "image/webp" : "image/jpeg";
+  const form = new FormData();
+  form.append("chat_id", String(chatId));
+  form.append("photo", new Blob([imageBytes], { type: mime }), `image.${ext}`);
+  form.append("caption", caption);
+  form.append("parse_mode", "HTML");
+  if (replyMarkup) form.append("reply_markup", JSON.stringify(replyMarkup));
+  const res = await fetch(`${TELEGRAM_API}${env.TELEGRAM_BOT_TOKEN}/sendPhoto`, {
+    method: "POST",
+    body: form,
+  });
+  const data: any = await res.json().catch(() => ({}));
+  if (!res.ok || data.ok === false) {
+    throw new Error(`Telegram sendPhoto failed (${res.status}): ${data.description ?? "unknown"}`);
+  }
+  return data.result;
+}
+
 /* ======================== KV storage helpers ======================== */
 
 function feedKey(url: string): string {
@@ -615,11 +697,23 @@ async function sendArticle(
   const photoUrl = await resolveArticleImage(env, item);
 
   if (photoUrl) {
+    // 1. Let Telegram fetch the image URL directly (fastest; works for most hosts).
     try {
       await sendPhoto(env, chatId, photoUrl, caption, replyMarkup);
       return true;
     } catch (err) {
-      console.error("sendPhoto failed, falling back to sendMessage:", err);
+      console.error("sendPhoto(url) failed, trying proxy upload:", err);
+    }
+    // 2. Some image CDNs throttle/block Telegram's fetcher. Download the image
+    //    ourselves and upload the bytes via multipart/form-data.
+    const bytes = await fetchImageBytes(photoUrl);
+    if (bytes) {
+      try {
+        await sendPhotoUpload(env, chatId, photoUrl, bytes, caption, replyMarkup);
+        return true;
+      } catch (err) {
+        console.error("sendPhoto(upload) failed:", err);
+      }
     }
   }
   await sendMessage(env, chatId, caption, {
