@@ -143,11 +143,7 @@ put_secret ADMIN_USER_ID "$ADMIN_USER_ID"
 put_secret WEBHOOK_SECRET "$WEBHOOK_SECRET"
 put_secret DEFAULT_CHAT_ID "${DEFAULT_CHAT_ID:-}"
 
-# ---- deploy -----------------------------------------------------------------------
-log "Deploying Worker '${WORKER_NAME}'…"
-npx wrangler deploy
-
-# ---- resolve the Worker URL ---------------------------------------------------------
+# ---- resolve the Worker URL (before deploy, so it can be injected as a var) -------
 if [ -n "${WORKER_URL:-}" ]; then
   WORKER_URL="${WORKER_URL%/}"
   log "Using provided WORKER_URL: ${WORKER_URL}"
@@ -160,6 +156,12 @@ else
   WORKER_URL="https://${WORKER_NAME}.${SUBDOMAIN}.workers.dev"
   log "Worker URL: ${WORKER_URL}"
 fi
+log "Injecting WORKER_URL into wrangler.toml…"
+sed_inplace "s|# WORKER_URL = \"https://telegram-rss-bot.<subdomain>.workers.dev\"|WORKER_URL = \"${WORKER_URL}\"|g" wrangler.toml
+
+# ---- deploy -----------------------------------------------------------------------
+log "Deploying Worker '${WORKER_NAME}'…"
+npx wrangler deploy
 
 # ---- register the Telegram webhook --------------------------------------------------
 log "Registering Telegram webhook at ${WORKER_URL}/webhook…"

@@ -45,9 +45,17 @@ id = "b8b45685f8334f0ab3eb19c06a95313a"
 # Optionally set these public vars:
 #   FETCH_OG_IMAGE      -> set to "false" to DISABLE the webpage og:image fallback
 #                          (on by default when a feed provides no image)
+#   WORKER_URL          -> this Worker's public URL (e.g.
+#                          https://telegram-rss-bot.<subdomain>.workers.dev).
+#                          The cron trigger re-dispatches the heavy polling via
+#                          an internal fetch to this URL, because a free-plan
+#                          Cron Trigger is capped at 10ms CPU (see index.ts). If
+#                          unset, scheduled polling is skipped.
 # ---------------------------------------------------------------------------
 [vars]
 # Uncomment and set if you want article cards posted to a fixed chat/channel.
 # DEFAULT_CHAT_ID = "123456789"
 # Disable the webpage image fallback (saves one fetch per image-less article).
 # FETCH_OG_IMAGE = "false"
+# Required for scheduled polling to self-dispatch past the 10ms cron CPU cap:
+WORKER_URL = "https://telegram-rss-bot.reyhaneh-fc0.workers.dev"

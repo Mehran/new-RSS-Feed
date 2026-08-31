@@ -33,6 +33,10 @@ interface Env {
   WEBHOOK_SECRET: string;
   DEFAULT_CHAT_ID?: string;
   FETCH_OG_IMAGE?: string;
+  // Public URL of this Worker (e.g. https://telegram-rss-bot.<subdomain>.workers.dev).
+  // The cron trigger uses it to re-dispatch the heavy polling through a normal
+  // request, which is NOT bound by the 10ms Cron CPU cap on the free plan.
+  WORKER_URL?: string;
 }
 
 interface FeedInfo {
@@ -93,15 +97,19 @@ const xmlParser = new XMLParser({
   parseTagValue: false, // keep values as strings
   parseAttributeValue: false,
   trimValues: false,
-  processEntities: {
-    enabled: true, // decode the 5 XML entities + numeric refs
-    // Large feeds (e.g. zoomit.ir) contain thousands of numeric character
-    // references (&#8204; = zero-width non-joiner, ubiquitous in Persian text),
-    // which exceed fast-xml-parser's default 1000-expansion safety cap.
-    // Raise the caps to a bounded but practical ceiling.
-    maxTotalExpansions: 100_000,
-    maxExpandedLength: 5_000_000,
-  },
+  // We intentionally do NOT let the parser expand XML entities. Large Persian
+  // feeds (e.g. zoomit.ir) carry tens of thousands of numeric char references
+  // (&#8204; zero-width non-joiner, etc.), and fast-xml-parser's entity
+  // expansion is single-threaded, synchronous CPU work that runs inside the
+  // `scheduled` handler. On the Workers free plan a Cron Trigger is capped at
+  // 10 ms of CPU, so that expansion alone repeatedly exhausted the budget and
+  // the invocation was killed with outcome `exceededResources` — meaning the
+  // news never got sent and there was no retry.
+  //
+  // Instead, we keep raw literal text (entities un-decoded) and decode only the
+  // little bit we actually use (see decodeEntities / canonicalId). This makes
+  // parsing effectively O(n) and removes the biggest CPU spike.
+  processEntities: false,
 });
 
 /** Parse an XML/RSS/Atom string (exported for unit testing). */
@@ -176,6 +184,19 @@ export function extractItems(parsed: any): ArticleItem[] {
       pubDate: textOf(e?.updated ?? e?.published),
       raw: e,
     });
+  }
+
+  // processEntities is disabled in the parser for CPU reasons (see above), so
+  // literal `&amp;`-style text is left un-decoded. Decode the fields we consume
+  // here so downstream code is unaffected: identity (guid) and display (title),
+  // plus descriptionHtml because it is HTML and must be a real document for
+  // extractImgFromHtml / stripHtml — which both then also decode as a second,
+  // harmless pass.
+  for (const item of items) {
+    item.title = decodeEntities(item.title);
+    item.link = decodeEntities(item.link);
+    item.guid = decodeEntities(item.guid);
+    item.descriptionHtml = decodeEntities(item.descriptionHtml);
   }
 
   // Newest first (RSS order is usually already newest-first; this makes it explicit).
@@ -1064,21 +1085,78 @@ async function handleRoot(request: Request, env: Env): Promise<Response> {
 
 /* ========================== Worker entry ========================== */
 
+const INTERNAL_POLL_SECRET_HEADER = "X-Internal-Poll-Secret";
+
+/**
+ * A Cron Trigger on the Workers free plan is capped at 10ms of CPU per run.
+ * Polling 14 RSS feeds (parsing large Persian feeds, leafing og:image pages,
+ * uploading photos) needs hundreds of ms of CPU, so a cron that does that work
+ * directly is always killed with outcome `exceededResources` and never sends
+ * news. Manual `/check` works because a webhook/fetch invocation is not bound
+ * by the same 10ms cap.
+ *
+ * Workaround: the `scheduled` handler does almost no work — it simply re-issues
+ * an HTTP request to this Worker's own `/internal/check` endpoint (guarded by
+ * WORKER_URL + a shared secret). That request runs under the normal fetch CPU
+ * budget, so the heavy polling actually completes. See `scheduled` below.
+ */
+async function handleInternalCheck(request: Request, env: Env): Promise<Response> {
+  const secret = request.headers.get(INTERNAL_POLL_SECRET_HEADER);
+  if (!env.WEBHOOK_SECRET || secret !== env.WEBHOOK_SECRET) {
+    return new Response("Unauthorized", { status: 401 });
+  }
+  const target = getTargetChatId(env, undefined);
+  if (!target) {
+    const summary: CheckSummary = { feeds: 0, sent: 0, errors: 1 };
+    console.error("Internal check skipped: no target chat (set DEFAULT_CHAT_ID or ADMIN_USER_ID).");
+    return Response.json(summary);
+  }
+  const summary = await checkAllFeeds(env, target);
+  console.log("Internal check complete:", summary);
+  return Response.json(summary);
+}
+
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
     if (url.pathname === "/webhook") return handleWebhook(request, env, ctx);
+    if (url.pathname === "/internal/check" && request.method === "POST") {
+      return handleInternalCheck(request, env);
+    }
     if (url.pathname === "/" && request.method === "GET") return handleRoot(request, env);
     return new Response("Not Found", { status: 404 });
   },
 
-  async scheduled(_event: ScheduledEvent, env: Env): Promise<void> {
-    const target = getTargetChatId(env, undefined);
-    if (!target) {
-      console.error("Scheduled check skipped: no target chat (set DEFAULT_CHAT_ID or ADMIN_USER_ID).");
+  async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+    // The cron slot only has 10ms of CPU on the free plan (see comment above),
+    // so we must not poll the feeds in here. Instead dispatch the actual check
+    // as a normal HTTP request to our own endpoint, which has the full fetch
+    // CPU budget. Any error there is reported to the logs + notifies Telegram.
+    const workerUrl = env.WORKER_URL;
+    if (!workerUrl) {
+      console.error(
+        "Scheduled check skipped: WORKER_URL is not set. Polling can't self-dispatch.",
+      );
       return;
     }
-    const summary = await checkAllFeeds(env, target);
-    console.log("Scheduled check complete:", summary);
+
+    ctx.waitUntil(
+      (async () => {
+        try {
+          const res = await fetch(new URL("/internal/check", workerUrl).toString(), {
+            method: "POST",
+            headers: {
+              [INTERNAL_POLL_SECRET_HEADER]: env.WEBHOOK_SECRET ?? "",
+              "Content-Type": "application/json",
+            },
+          });
+          if (!res.ok) {
+            console.error("Internal check returned", res.status, await res.text().catch(() => ""));
+          }
+        } catch (err) {
+          console.error("Internal check fetch failed:", (err as Error)?.message ?? err);
+        }
+      })(),
+    );
   },
 };
