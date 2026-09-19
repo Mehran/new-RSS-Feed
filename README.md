@@ -23,24 +23,39 @@ A production-ready, serverless RSS/Atom feed reader that posts new articles to T
    * **Stage 1 (XML Feed):** Inspects `<media:content>`, `<media:thumbnail>`, `<enclosure type="image/*">`, and embedded `<img>` tags inside `content:encoded` / `description`.
    * **Stage 2 (Open Graph Fallback):** If no image is declared in the feed, fetches the target `<head>` to resolve `og:image`, `twitter:image`, or `image_src`.
    * **Resilience:** Invalid formats, relative paths, and tracking pixels are filtered out; gracefully downgrades from `sendPhoto` to `sendMessage` on failure.
-5. **Content Normalization:** Strips HTML payloads safely, purges CMS tracking footers (e.g., WordPress syndication tags), normalizes entities, and limits captions within Telegram's 1024-character boundary.
+5. **Content Normalization:** Strips HTML payloads safely, purges CMS tracking footers, normalizes entities, and limits captions within Telegram's 1024-character boundary.
 
 ---
 
-## Quick Start — Automated Setup (`deploy.sh`)
+## Deployment
 
-The deployment script automatically provisions KV namespaces, binds identifiers to `wrangler.toml`, registers encrypted production secrets, deploys the Worker script, and establishes the Telegram webhook.
+### Prerequisites
 
-### 1. Generate Cloudflare API Token
+* Node.js 18+ & npm
+* A free Cloudflare account
+* A Telegram Bot token from [@BotFather](https://t.me/BotFather)
+* Your numeric Telegram User ID (from [@userinfobot](https://t.me/userinfobot))
 
-Navigate to **Cloudflare Dashboard → My Profile → API Tokens → Create Custom Token** with the following **Account**-level permissions:
+> **Note:** Send `/start` to your bot in Telegram before running the first scheduled sync.
 
-| Permission | Scope | Access Level |
-| :--- | :--- | :--- |
-| **Workers Scripts** | Account | Edit |
-| **Workers KV Storage** | Account | Edit |
-| **Account Settings** | Account | Read |
+---
 
-Obtain your **Account ID** from the dashboard overview or run:
+### Option A: Automated (`deploy.sh`) — Recommended
+
+The deployment script provisions required KV namespaces, maps their IDs into `wrangler.toml`, encrypts secrets, and registers the Telegram webhook automatically.
+
+1. **Create an Account-level Cloudflare API Token** via **My Profile → API Tokens → Create Custom Token** with permissions:
+   * `Workers Scripts: Edit`
+   * `Workers KV Storage: Edit`
+   * `Account Settings: Read`
+
+2. **Run Deploy:**
+
 ```bash
-npx wrangler whoami
+export CLOUDFLARE_API_TOKEN="<your-cloudflare-token>"
+export CLOUDFLARE_ACCOUNT_ID="<your-account-id>"
+export TELEGRAM_BOT_TOKEN="<your-telegram-bot-token>"
+export ADMIN_USER_ID="<your-telegram-user-id>"
+
+chmod +x deploy.sh
+./deploy.sh
