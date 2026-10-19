@@ -15,9 +15,11 @@ A Telegram RSS feed reader bot with two deployments:
 Telegram Serverless has **no cron and no public HTTP endpoint** — its endpoints
 are only callable by a Telegram user inside the bot's Mini App, so there is no
 server-to-server API. Polling is therefore scheduled by a Telethon **userbot**
-(`userbot/`) that sends `/check`; the Serverless handler drives the poll and
-persists the results. Do not try to move the feed-fetching/sending engine into
-`tgcloud/`, and do not try to make the Worker call Serverless or own state.
+(`userbot/`) that sends `/check`; the schedule runs in **GitHub Actions**
+(`.github/workflows/poll.yml`), so no local machine needs to stay on. The
+Serverless handler drives the poll and persists the results. Do not try to move
+the feed-fetching/sending engine into `tgcloud/`, and do not try to make the
+Worker call Serverless or own state.
 
 Feeds, seen items and admins live only in Telegram Serverless SQLite. The Worker
 never reads or writes them: every `/api/poll` request is fully parameterised.
@@ -40,8 +42,10 @@ never reads or writes them: every `/api/poll` request is fully parameterised.
   it (the repository is public).
 - `tgcloud/schema.js` — `feeds`, `seen`, `admins` tables (the source of truth).
 - `src/index.ts` — Worker entry: `/api/*` routes only. Stateless.
-- `userbot/trigger.py` — Telethon `/check` scheduler; `userbot/login.py` creates
-  its session. Never commit `userbot/*.session` or `userbot/.env`.
+- `userbot/trigger.py` — Telethon `/check` trigger run by GitHub Actions;
+  `userbot/login.py` creates its session. The workflow reads
+  `TG_API_ID`/`TG_API_HASH`/`TG_SESSION_STRING` from repo secrets. Never commit
+  `userbot/*.session`, `userbot/.env`, or the session string.
 - `tests/` — Vitest. Worker tests mock `fetch` (the Worker has no storage);
   command tests use fake `api`/`worker` objects.
 
@@ -78,7 +82,7 @@ npm run typecheck            # tsc --noEmit for src/ and tests/
 npm run deploy:worker        # wrangler deploy (API only)
 npm run deploy:tgcloud       # tgcloud push (+ migrate)
 npm run deploy               # both, Worker first
-python userbot/trigger.py --loop   # local scheduler (after login.py)
+python userbot/trigger.py --once   # manual /check via the userbot session
 ```
 
 Full SDK reference: [docs/tgcloud-sdk.md](docs/tgcloud-sdk.md).

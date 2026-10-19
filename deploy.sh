@@ -185,4 +185,4 @@ ok "Deployment complete!"
 echo
 echo "Worker:      ${WORKER_URL}  (stateless feed engine + /api/*)"
 echo "Serverless:  tgcloud/handlers/message.js  (commands + SQLite state)"
-echo "Scheduler:   userbot/trigger.py --loop     (sends /check; see userbot/README.md)"
+echo "Scheduler:   .github/workflows/poll.yml    (GitHub Actions sends /check; see userbot/README.md)"

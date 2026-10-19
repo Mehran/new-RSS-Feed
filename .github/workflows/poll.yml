@@ -1,0 +1,41 @@
+name: Poll RSS Feeds
+
+# Telegram Serverless has no cron, so a Telethon userbot sends it /check.
+# Running that trigger here keeps the schedule off any local machine.
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Never run two triggers at once: the userbot session must not be used
+# concurrently, and back-to-back polls would double-send.
+concurrency:
+  group: rss-poll
+  cancel-in-progress: false
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: userbot/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r userbot/requirements.txt
+
+      - name: Send /check to the bot
+        env:
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+          TG_SESSION_STRING: ${{ secrets.TG_SESSION_STRING }}
+          BOT_USERNAME: MehranRSSReader_bot
+        run: python userbot/trigger.py --once

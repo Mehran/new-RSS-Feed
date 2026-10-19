@@ -35,6 +35,7 @@ import sys
 
 from dotenv import load_dotenv
 from telethon import TelegramClient
+from telethon.sessions import StringSession
 
 log = logging.getLogger("rss-trigger")
 
@@ -103,7 +104,11 @@ async def main() -> int:
     )
 
     api_id, api_hash, session, bot, interval = load_config()
-    client = TelegramClient(session, api_id, api_hash)
+    # A StringSession (e.g. from a GitHub Actions secret) takes precedence over
+    # a local SQLite session file.
+    session_string = env("TG_SESSION_STRING")
+    client_session = StringSession(session_string) if session_string else session
+    client = TelegramClient(client_session, api_id, api_hash)
     await client.connect()
     if not await client.is_user_authorized():
         await client.disconnect()

@@ -14,7 +14,9 @@ Telegram Serverless has **no cron trigger**, **no public HTTP endpoint** and no
 secret store: code only runs on a Telegram update, and its endpoints are only
 callable by a real Telegram user inside the bot's Mini App. That is why state
 lives there while the Worker stays stateless, and why polling is scheduled by a
-small **userbot** that sends `/check` (see [`userbot/`](userbot/)).
+small **userbot** that sends `/check`. The schedule runs in **GitHub Actions**
+(`.github/workflows/poll.yml`), so no local machine needs to stay on (see
+[`userbot/`](userbot/)).
 
 ---
 
@@ -23,8 +25,9 @@ small **userbot** that sends `/check` (see [`userbot/`](userbot/)).
 1. **Command** — Telegram delivers an update to the Serverless handler
    (`tgcloud/handlers/message.js`). It checks the sender against the SQLite admin
    list and calls the stateless Worker with a shared secret.
-2. **Schedule** — a Telethon userbot sends `/check` to the bot every
-   `INTERVAL_SECONDS` (default 15 min). There is no Cloudflare cron.
+2. **Schedule** — a GitHub Actions workflow runs the Telethon userbot every
+   15 minutes; the userbot sends `/check` to the bot. There is no Cloudflare
+   cron and no local scheduler.
 3. **Poll** — the Serverless `/check` handler loads feeds and seen ids from
    SQLite, then calls the Worker's `POST /api/poll`. The Worker parses each feed,
    diffs new articles against the seen set (SHA-256 of the article GUID/link,
@@ -61,8 +64,9 @@ The Worker no longer uses KV, so no KV permission or namespace is needed.
 3. In BotFather: **your bot → Serverless → CLI Access → Access token**. It looks
    like `app<id>:<secret>` — this is **not** the bot API token.
 4. Get your numeric user ID from [@userinfobot](https://t.me/userinfobot).
-5. For the scheduler, log in a Telegram account as a userbot and add its numeric
-   id to `ADMIN_USER_ID`. See [`userbot/README.md`](userbot/README.md).
+5. For the scheduler, log in a Telegram account as a userbot once and add its
+   numeric id to `ADMIN_USER_ID`. The resulting session string goes into the
+   GitHub secrets, not a local file. See [`userbot/README.md`](userbot/README.md).
 
 You do **not** need to create a second bot: commands arrive through the webhook
 that Telegram Serverless manages for you.
@@ -120,12 +124,17 @@ npm run deploy:tgcloud
 copy lives in deployed code, but it must never be committed). `deploy.sh` keeps
 both in sync automatically.
 
-Finally, log in the userbot and start the trigger (see
-[`userbot/README.md`](userbot/README.md)):
+Finally, create the userbot session and add it to GitHub so the scheduled
+workflow can send `/check` (see [`userbot/README.md`](userbot/README.md)):
 
 ```bash
-cd userbot && python login.py && python trigger.py --loop
+cd userbot && python login.py
+# convert the session to a StringSession and store it as a repo secret
+# (TG_API_ID, TG_API_HASH, TG_SESSION_STRING)
 ```
+
+The workflow `.github/workflows/poll.yml` runs every 15 minutes. You can also
+start it manually from **Actions → Poll RSS Feeds → Run workflow**.
 
 ---
 
@@ -141,8 +150,9 @@ cd userbot && python login.py && python trigger.py --loop
 | `/admin <id>` | Grant admin | admin |
 | `/unadmin <id>` | Revoke admin | admin |
 
-The userbot polls every **15 minutes** by default (`userbot/.env` →
-`INTERVAL_SECONDS`).
+The GitHub Actions workflow polls every **15 minutes**. GitHub may delay
+scheduled jobs slightly, and disables schedules after ~60 days without repo
+activity; re-enable it from the Actions tab if that happens.
 
 ### Write budget
 
@@ -204,9 +214,10 @@ The Worker must be deployed (or running under `wrangler dev`) for `/add` and
 - `/api/poll` runs to completion under the Serverless handler and returns the
   final summary, so `/check` waits for the result instead of fire-and-forget.
 - Seen dedupe is check-then-set; the race window is negligible for one poller.
-  The userbot trigger avoids overlapping runs.
-- Telegram Serverless has no cron and no public HTTP endpoint; keep polling in
-  the userbot and the feed engine on Cloudflare.
+  The Actions workflow's `concurrency` group avoids overlapping runs.
+- Telegram Serverless has no cron and no public HTTP endpoint; keep the schedule
+  in GitHub Actions and the feed engine on Cloudflare.
 - Rotate `CLOUDFLARE_API_TOKEN`, the bot token, and `TGCLOUD_TOKEN` if they have
   ever been pasted into a chat or committed. Never commit
-  `tgcloud/lib/config.js` or userbot `.session` files.
+  `tgcloud/lib/config.js`, `userbot/.env`, userbot `.session` files, or
+  `TG_SESSION_STRING`.
