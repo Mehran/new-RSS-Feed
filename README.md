@@ -139,6 +139,15 @@ both in sync automatically.
 
 The cron polls every **15 minutes** (`wrangler.toml` → `[triggers] crons`).
 
+### KV write budget
+
+The Workers **free plan allows 1,000 KV writes per day**. Poll status for all
+feeds is stored in one `feedMeta` key, so a poll costs **one write** (plus one
+write per newly seen article), not one write per feed. Adding a feed writes the
+feed record plus up to 30 "already seen" markers. Avoid reintroducing per-feed
+writes in the poll loop, or the daily limit will be exhausted before the day
+ends and `/add`, deduplication and metadata updates will fail until 00:00 UTC.
+
 ---
 
 ## Configuration

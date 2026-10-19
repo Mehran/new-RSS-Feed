@@ -239,6 +239,35 @@ describe("feeds", () => {
     }
   });
 
+  it("returns a clear error when the daily KV write limit is hit", async () => {
+    const { env, feeds } = makeEnv();
+    const { ctx } = makeCtx();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        new Response(FEED_XML, { headers: { "content-type": "application/xml" } }),
+      ),
+    );
+    vi.spyOn(env.RSS_SEEN, "put").mockRejectedValue(
+      new Error("KV put() limit exceeded for the day."),
+    );
+
+    const res = await worker.fetch(
+      apiRequest("/api/feeds", {
+        method: "POST",
+        body: JSON.stringify({ url: "example.com/feed" }),
+      }),
+      env,
+      ctx,
+    );
+
+    expect(res.status).toBe(503);
+    const body: any = await res.json();
+    expect(body.error).toMatch(/daily KV write limit/i);
+    // The feed record is written only after the seen backfill succeeds.
+    expect(feeds.store.size).toBe(0);
+  });
+
   it("rejects a duplicate feed with 409", async () => {
     const { env, feeds } = makeEnv();
     const { ctx } = makeCtx();
@@ -309,6 +338,39 @@ describe("check", () => {
       ctx,
     );
     expect(await res.json()).toEqual({ ok: true, feeds: 0, sent: 0, errors: 0 });
+  });
+
+  it("writes feed metadata once per poll instead of once per feed", async () => {
+    const { env, feeds, settings } = makeEnv();
+    const { ctx } = makeCtx();
+    const emptyFeed =
+      '<?xml version="1.0"?><rss version="2.0"><channel><title>Empty</title></channel></rss>';
+
+    feeds.store.set(
+      "feed:https://a.test/feed",
+      JSON.stringify({ url: "https://a.test/feed", title: "A", addedAt: 1 }),
+    );
+    feeds.store.set(
+      "feed:https://b.test/feed",
+      JSON.stringify({ url: "https://b.test/feed", title: "B", addedAt: 2 }),
+    );
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        new Response(emptyFeed, { headers: { "content-type": "application/xml" } }),
+      ),
+    );
+    const putSpy = vi.spyOn(settings, "put");
+
+    const res = await worker.fetch(
+      apiRequest("/api/check", { method: "POST", body: JSON.stringify({ chatId: 999 }) }),
+      env,
+      ctx,
+    );
+
+    expect(await res.json()).toEqual({ ok: true, feeds: 2, sent: 0, errors: 0 });
+    expect(putSpy).toHaveBeenCalledTimes(1);
+    expect(putSpy.mock.calls[0][0]).toBe("feedMeta");
   });
 
   it("rejects an unknown route", async () => {

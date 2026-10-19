@@ -14,9 +14,11 @@
  * polling stays here.
  *
  * State lives in Cloudflare KV:
- *       RSS_FEEDS    -> feed URL -> { url, title, addedAt, lastChecked, lastError }
+ *       RSS_FEEDS    -> feed URL -> { url, title, addedAt, ... }
  *       RSS_SEEN     -> sha256(article id) -> timestamp (with TTL, auto-expires)
  *       RSS_SETTINGS -> "admins" -> JSON array of authorized admin user IDs
+ *                       "feedMeta" -> per-feed poll status (ONE write per poll,
+ *                       because the free plan allows 1,000 writes/day)
  *
  * Message card layout (HTML parse mode):
  *       <b>Title</b>
@@ -65,6 +67,17 @@ interface FeedInfo {
   url: string;
   title: string;
   addedAt: number;
+  lastChecked: number;
+  lastError: string | null;
+  itemCount?: number;
+}
+
+/**
+ * Per-feed poll status is kept in ONE KV key. Updating every feed record after
+ * every poll (21 feeds x 96 runs/day) exhausted the free plan's 1,000 KV
+ * writes/day before the day was over, which also broke /add and seen tracking.
+ */
+interface FeedMetaEntry {
   lastChecked: number;
   lastError: string | null;
   itemCount?: number;
@@ -660,7 +673,28 @@ function feedKey(url: string): string {
   return u.length <= 450 ? `feed:${u}` : `feed:h:${fnv1a(u)}`;
 }
 
+const FEED_META_KEY = "feedMeta";
+
+async function getFeedMeta(env: Env): Promise<Record<string, FeedMetaEntry>> {
+  const raw = await env.RSS_SETTINGS.get(FEED_META_KEY);
+  if (!raw) return {};
+  try {
+    const value = JSON.parse(raw);
+    return value && typeof value === "object" ? value : {};
+  } catch {
+    return {};
+  }
+}
+
+async function putFeedMeta(
+  env: Env,
+  meta: Record<string, FeedMetaEntry>,
+): Promise<void> {
+  await env.RSS_SETTINGS.put(FEED_META_KEY, JSON.stringify(meta));
+}
+
 async function listFeeds(env: Env): Promise<FeedInfo[]> {
+  const meta = await getFeedMeta(env);
   const feeds: FeedInfo[] = [];
   let cursor: string | undefined;
   do {
@@ -669,7 +703,16 @@ async function listFeeds(env: Env): Promise<FeedInfo[]> {
       const raw = await env.RSS_FEEDS.get(k.name);
       if (!raw) continue;
       try {
-        feeds.push(JSON.parse(raw) as FeedInfo);
+        const feed = JSON.parse(raw) as FeedInfo;
+        // Prefer the consolidated status; fall back to the legacy per-feed
+        // fields for feeds that have not been polled since this change.
+        const status = meta[k.name];
+        if (status) {
+          feed.lastChecked = status.lastChecked;
+          feed.lastError = status.lastError;
+          if (status.itemCount !== undefined) feed.itemCount = status.itemCount;
+        }
+        feeds.push(feed);
       } catch {
         /* ignore malformed entries */
       }
@@ -687,10 +730,6 @@ async function isSeen(env: Env, rawId: string): Promise<boolean> {
 async function markSeen(env: Env, rawId: string): Promise<void> {
   const key = `seen:${await sha256Hex(canonicalId(rawId))}`;
   await env.RSS_SEEN.put(key, String(Date.now()), { expirationTtl: SEEN_TTL_SECONDS });
-}
-
-async function updateFeedMeta(env: Env, feed: FeedInfo, patch: Partial<FeedInfo>): Promise<void> {
-  await env.RSS_FEEDS.put(feedKey(feed.url), JSON.stringify({ ...feed, ...patch }));
 }
 
 /* ======================== Feed fetching / polling ======================== */
@@ -814,7 +853,7 @@ async function processFeed(
   feed: FeedInfo,
   chatId: number,
   budget: number,
-): Promise<{ sent: number }> {
+): Promise<{ sent: number; itemCount: number }> {
   const parsed = await fetchAndParse(feed.url);
   const items = extractItems(parsed).slice(0, MAX_ITEMS_PER_FEED);
   let sent = 0;
@@ -824,36 +863,54 @@ async function processFeed(
     if (!rawId) continue;
     if (await isSeen(env, rawId)) continue; // already posted
     if (sent >= budget) break;
-    await sendArticle(env, chatId, item, feed.title);
+    // Write before sending: if the daily KV write limit is reached, skip the
+    // article instead of posting it again on every poll (at-most-once).
     await markSeen(env, rawId);
+    await sendArticle(env, chatId, item, feed.title);
     sent++;
   }
 
-  await updateFeedMeta(env, feed, {
-    lastChecked: Date.now(),
-    lastError: null,
-    itemCount: items.length,
-  });
-  return { sent };
+  return { sent, itemCount: items.length };
 }
 
 async function checkAllFeeds(env: Env, chatId: number): Promise<CheckSummary> {
   const feeds = await listFeeds(env);
+  const meta = await getFeedMeta(env);
   const summary: CheckSummary = { feeds: feeds.length, sent: 0, errors: 0 };
+  const currentKeys = new Set(feeds.map((feed) => feedKey(feed.url)));
+  for (const key of Object.keys(meta)) {
+    if (!currentKeys.has(key)) delete meta[key]; // prune removed feeds
+  }
+
   let budget = MAX_SEND_PER_RUN;
+  let processed = 0;
 
   for (const feed of feeds) {
     if (budget <= 0) break;
+    const key = feedKey(feed.url);
     try {
-      const { sent } = await processFeed(env, feed, chatId, budget);
+      const { sent, itemCount } = await processFeed(env, feed, chatId, budget);
       summary.sent += sent;
       budget -= sent;
+      meta[key] = { lastChecked: Date.now(), lastError: null, itemCount };
     } catch (err) {
       summary.errors++;
-      await updateFeedMeta(env, feed, {
+      meta[key] = {
         lastChecked: Date.now(),
         lastError: String((err as Error)?.message ?? err).slice(0, 200),
-      });
+        itemCount: meta[key]?.itemCount,
+      };
+    }
+    processed++;
+  }
+
+  // One write per poll, not one per feed. A failure here must not hide the
+  // fact that articles were already delivered.
+  if (processed > 0) {
+    try {
+      await putFeedMeta(env, meta);
+    } catch (err) {
+      console.error("Failed to persist feed metadata:", err);
     }
   }
   return summary;
@@ -984,12 +1041,25 @@ async function addFeed(env: Env, rawUrl: string, chatId?: number) {
     lastError: null,
     itemCount: items.length,
   };
-  await env.RSS_FEEDS.put(feedKey(url), JSON.stringify(feed));
-
-  // Backfill-silence: existing items are marked as read so history isn't spammed.
+  // Backfill-silence: existing items are marked as read so history isn't
+  // spammed. Do this before storing the feed, so a failed write (for example
+  // the daily KV limit) cannot leave a feed that re-sends its history.
   for (const item of items.slice(0, MAX_ITEMS_PER_FEED)) {
     const rawId = getItemRawId(item);
     if (rawId) await markSeen(env, rawId);
+  }
+
+  await env.RSS_FEEDS.put(feedKey(url), JSON.stringify(feed));
+  try {
+    const meta = await getFeedMeta(env);
+    meta[feedKey(url)] = {
+      lastChecked: feed.lastChecked,
+      lastError: null,
+      itemCount: items.length,
+    };
+    await putFeedMeta(env, meta);
+  } catch (err) {
+    console.error("feed added, but metadata write failed:", err);
   }
 
   if (chatId) {
@@ -1124,6 +1194,13 @@ async function handleCommandApi(
     return apiError("Not found", 404);
   } catch (err) {
     if (err instanceof ApiError) return apiError(err.message, err.status);
+    const message = String((err as Error)?.message ?? err);
+    if (/KV put\(\) limit exceeded/i.test(message)) {
+      return apiError(
+        "⚠️ Cloudflare's daily KV write limit has been reached. Feed changes and new-item tracking will resume after 00:00 UTC.",
+        503,
+      );
+    }
     console.error("Command API error:", err);
     return apiError("Internal error", 500);
   }

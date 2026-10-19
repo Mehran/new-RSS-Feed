@@ -53,6 +53,10 @@ it is not used by the command handlers.
   versa. `./deploy.sh` does both.
 - Deploy order matters: deploy the Worker first (it adds `/api/*`), then push
   the Serverless project (which moves the Telegram webhook to the platform).
+- The free KV plan allows **1,000 writes/day**. Never write per-feed status in
+  the poll loop; `feedMeta` in `RSS_SETTINGS` is written once per poll. Adding a
+  feed also writes up to 30 seen markers. Exceeding the limit breaks `/add` and
+  deduplication until 00:00 UTC.
 
 ## Commands
 
