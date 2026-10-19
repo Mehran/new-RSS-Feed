@@ -1,0 +1,5 @@
+{
+  // Telegram Serverless project config. Only tgcloud/ is deployed by tgcloud;
+  // the Cloudflare Worker in src/ is deployed separately with Wrangler.
+  "$schema": "./node_modules/@tgcloud/cli/schema/tgcloud.json"
+}

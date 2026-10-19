@@ -1,0 +1,17 @@
+node_modules/
+.wrangler/
+
+# tgcloud CLI machine state (may contain the project token)
+.tgcloud/
+
+# Generated at deploy time; contains COMMAND_API_SECRET. Never commit it.
+tgcloud/lib/config.js
+
+# Local secrets
+.dev.vars
+.dev.vars.*
+.env
+.env.*
+!.env.example
+
+*.log
