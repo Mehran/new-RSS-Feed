@@ -1,8 +1,8 @@
 /**
  * Command routing for the Telegram Serverless layer.
  *
- * `api` (the Bot API) and `worker` (the Cloudflare client) are injected so the
- * whole routing table can be tested with fakes.
+ * `api` (the Bot API) and `worker` (the Serverless DB store) are injected so
+ * the whole routing table can be tested with fakes.
  */
 
 import {
@@ -57,7 +57,8 @@ export async function handleMessage(message, { api, worker }) {
     switch (command) {
       case "add": {
         if (!args) return await reply("Usage: /add <url>");
-        // The Worker stores the feed and sends the confirmation + preview card.
+        // The store inserts the feed and records its current items as seen;
+        // the Worker sends the confirmation + preview card.
         await worker.addFeed(args, chatId);
         return;
       }
@@ -81,6 +82,8 @@ export async function handleMessage(message, { api, worker }) {
 
       case "check": {
         await reply("🔍 Checking all feeds…");
+        // The store loads SQLite state, calls the stateless Worker /api/poll,
+        // and persists the returned seen ids and feed metadata.
         const summary = await worker.check(chatId);
         return await reply(formatCheck(summary));
       }
@@ -92,11 +95,11 @@ export async function handleMessage(message, { api, worker }) {
           return await reply(`Usage: /${command} <user_id>`);
         }
         const admins = await worker.setAdmin(userId, command === "admin");
-        // ADMIN_USER_ID is always unioned in by the Worker, so an env-based
+        // BOOTSTRAP_ADMIN_ID is always unioned in by the store, so the env-based
         // bootstrap admin cannot be removed here. Say so instead of lying.
         if (command === "unadmin" && Array.isArray(admins) && admins.includes(userId)) {
           return await reply(
-            `⚠️ <code>${userId}</code> is configured through ADMIN_USER_ID and stays an admin. Remove that Worker secret to revoke it.`,
+            `⚠️ <code>${userId}</code> is configured through BOOTSTRAP_ADMIN_ID and stays an admin. Change the Serverless config to revoke it.`,
             { parse_mode: "HTML", disable_web_page_preview: true },
           );
         }

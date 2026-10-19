@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "Telegram RSS feed reader: commands on Telegram Serverless, polling and storage on Cloudflare Workers.",
+  "description": "Telegram RSS feed reader: commands, state and scheduling on Telegram Serverless; feed fetching/parsing and card delivery on a stateless Cloudflare Worker.",
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "npm run deploy:worker && npm run deploy:tgcloud",

@@ -15,3 +15,9 @@ tgcloud/lib/config.js
 !.env.example
 
 *.log
+
+# Userbot trigger session files and Python bytecode
+userbot/*.session
+userbot/*.session-journal
+__pycache__/
+userbot/__pycache__/

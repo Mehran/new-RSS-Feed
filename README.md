@@ -7,33 +7,38 @@ The project runs on **two** platforms, on purpose:
 
 | Layer | Runtime | What it does |
 |-------|---------|--------------|
-| Commands | **Telegram Serverless** (`tgcloud/`) | Receives Telegram updates, authorizes the sender, handles `/add`, `/remove`, `/list`, `/check`, `/admin`, `/unadmin`. Stateless. |
-| Engine | **Cloudflare Worker** (`src/`) | Owns Cloudflare KV, fetches and parses feeds, extracts images, sends article cards, runs the cron poll, and exposes the authenticated `/api/*` routes the command layer calls. |
+| State + commands | **Telegram Serverless** (`tgcloud/`) | Receives Telegram updates, authorizes the sender, handles `/add`, `/remove`, `/list`, `/check`, `/admin`, `/unadmin`, and owns SQLite state (feeds, seen ids, admins). |
+| Feed engine | **Cloudflare Worker** (`src/`) | Stateless: fetches and parses feeds, extracts images, sends article cards, and exposes the authenticated `/api/feed/preview` and `/api/poll` routes. |
 
-Telegram Serverless has **no cron trigger** and **no public HTTP endpoint** — code
-only runs on a Telegram update or a Mini App endpoint. That is why polling and
-storage stay on Cloudflare; the cron cannot live on Telegram.
+Telegram Serverless has **no cron trigger**, **no public HTTP endpoint** and no
+secret store: code only runs on a Telegram update, and its endpoints are only
+callable by a real Telegram user inside the bot's Mini App. That is why state
+lives there while the Worker stays stateless, and why polling is scheduled by a
+small **userbot** that sends `/check` (see [`userbot/`](userbot/)).
 
 ---
 
 ## How it works
 
 1. **Command** — Telegram delivers an update to the Serverless handler
-   (`tgcloud/handlers/message.js`). It checks the sender against the admin list
-   and calls the Worker's `/api/*` routes with a shared secret.
-2. **Cron** — every 15 minutes the Worker's `scheduled` handler pings the
-   `rss-dispatcher` Worker, which calls back into `/internal/check`. (A Worker
-   cannot fetch its own URL, and a free-plan cron is capped at 10 ms CPU.)
-3. **Poll** — `/internal/check` (or `/api/check` from `/check`) iterates the
-   saved feeds, parses them, diffs new articles against `RSS_SEEN` (SHA-256 of
-   the article GUID/link, 30-day TTL), and sends cards.
+   (`tgcloud/handlers/message.js`). It checks the sender against the SQLite admin
+   list and calls the stateless Worker with a shared secret.
+2. **Schedule** — a Telethon userbot sends `/check` to the bot every
+   `INTERVAL_SECONDS` (default 15 min). There is no Cloudflare cron.
+3. **Poll** — the Serverless `/check` handler loads feeds and seen ids from
+   SQLite, then calls the Worker's `POST /api/poll`. The Worker parses each feed,
+   diffs new articles against the seen set (SHA-256 of the article GUID/link,
+   30-day TTL), sends cards, and returns the delivered ids plus per-feed
+   metadata. The handler writes those ids and metadata back to SQLite.
 4. **Images** — `media:content`, `media:thumbnail`, `enclosure`, the first
    `<img>` in the body, then the article page's `og:image`. Telegram fetches the
    URL; if its fetcher is blocked, the Worker downloads and uploads the bytes.
-5. **State** — everything lives in Cloudflare KV:
-   - `RSS_FEEDS` — `feed:<url>` → `{ url, title, addedAt, lastChecked, lastError, itemCount }`
-   - `RSS_SEEN` — `seen:<sha256>` → timestamp (TTL 30 days)
-   - `RSS_SETTINGS` — `admins` → JSON array of admin user IDs
+5. **State** — everything lives in Telegram Serverless SQLite, managed by
+   `tgcloud/lib/store.js`:
+   - `feeds` — `{ url, title, chatId, addedAt, lastChecked, lastError, itemCount }`
+   - `seen` — `{ itemId, seenAt }` (SHA-256, 30-day TTL)
+   - `admins` — `{ userId, addedAt }`
+   Bootstrap admins from `BOOTSTRAP_ADMIN_ID` are always authorized.
 
 ---
 
@@ -42,21 +47,13 @@ storage stay on Cloudflare; the cron cannot live on Telegram.
 ### 1. Cloudflare
 
 Create an API token (**My Profile → API Tokens → Create Custom Token**, account
-scope) with:
+scope) with **Workers Scripts: Edit** (and **Account Settings: Read** so
+`deploy.sh` can resolve the `workers.dev` subdomain). Note your **Account ID**
+(dashboard sidebar or `npx wrangler whoami`).
 
-| Permission | Access |
-|------------|--------|
-| Workers Scripts | Edit |
-| Workers KV Storage | Edit |
-| Account Settings | Read |
+The Worker no longer uses KV, so no KV permission or namespace is needed.
 
-> Updating an existing deployment only needs **Workers Scripts: Edit** — the KV
-> namespace IDs are already in `wrangler.toml`. KV access is required only to
-> create the namespaces on a first install.
-
-Note your **Account ID** (dashboard sidebar or `npx wrangler whoami`).
-
-### 2. Telegram bot
+### 2. Telegram bot + userbot
 
 1. Create the bot with [@BotFather](https://t.me/BotFather) and copy its token.
 2. In BotFather: **your bot → Serverless → turn it on**. This unlocks the
@@ -64,6 +61,8 @@ Note your **Account ID** (dashboard sidebar or `npx wrangler whoami`).
 3. In BotFather: **your bot → Serverless → CLI Access → Access token**. It looks
    like `app<id>:<secret>` — this is **not** the bot API token.
 4. Get your numeric user ID from [@userinfobot](https://t.me/userinfobot).
+5. For the scheduler, log in a Telegram account as a userbot and add its numeric
+   id to `ADMIN_USER_ID`. See [`userbot/README.md`](userbot/README.md).
 
 You do **not** need to create a second bot: commands arrive through the webhook
 that Telegram Serverless manages for you.
@@ -74,7 +73,8 @@ that Telegram Serverless manages for you.
 export CLOUDFLARE_API_TOKEN="<cloudflare-token>"
 export CLOUDFLARE_ACCOUNT_ID="<account-id>"
 export TELEGRAM_BOT_TOKEN="<bot-token>"
-export ADMIN_USER_ID="<your-user-id>"
+export ADMIN_USER_ID="<your-user-id>,<userbot-user-id>"
+export DEFAULT_CHAT_ID="<your-user-id>"
 export TGCLOUD_TOKEN="app<id>:<secret>"
 
 ./deploy.sh
@@ -82,39 +82,36 @@ export TGCLOUD_TOKEN="app<id>:<secret>"
 
 `deploy.sh` is idempotent. It:
 
-1. creates or reuses the three KV namespaces,
-2. generates/loads `COMMAND_API_SECRET` (into the git-ignored
-   `tgcloud/lib/config.js`) and `INTERNAL_POLL_SECRET` (into `.tgcloud/`),
+1. refuses to deploy if `wrangler.toml` still has leftover KV bindings,
+2. creates/loads `COMMAND_API_SECRET` into the git-ignored
+   `tgcloud/lib/config.js` and syncs `WORKER_URL` / admin ids into it,
 3. deploys the Worker, then uploads its secrets,
-4. deploys the `rss-dispatcher` relay and attaches its secret,
-5. pushes `tgcloud/` and applies the (safe) schema migration — which also
+4. pushes `tgcloud/` and applies the (safe) schema migration, which also
    re-points the Telegram webhook at Telegram Serverless.
 
 Deploy order matters: the Worker must expose `/api/*` before the Serverless
 handlers start receiving commands.
 
-The GitHub Actions workflow in `.github/workflows/deploy.yml` runs the tests on
-every push and only deploys on a manual **Run workflow** (because deploying also
+The GitHub Actions workflow in `.github/workflows/deploy.yml` runs tests on every
+push and only deploys on a manual **Run workflow** (because deploying also
 re-points the Telegram webhook). Configure `CLOUDFLARE_API_TOKEN`,
 `CLOUDFLARE_ACCOUNT_ID`, `TELEGRAM_BOT_TOKEN`, `ADMIN_USER_ID`, `TGCLOUD_TOKEN`
-and, optionally, `COMMAND_API_SECRET`, `INTERNAL_POLL_SECRET` and
-`DEFAULT_CHAT_ID` as repository secrets before running it.
+and, optionally, `COMMAND_API_SECRET` and `DEFAULT_CHAT_ID` as repository
+secrets before running it.
 
 ### Manual deployment
 
 ```bash
 # tgcloud/lib/config.js is generated and git-ignored. Create it from the
-# template and fill in both values before pushing the Serverless project.
+# template and fill in WORKER_URL, COMMAND_API_SECRET, DEFAULT_CHAT_ID and
+# BOOTSTRAP_ADMIN_ID before pushing the Serverless project.
 cp tgcloud/lib/config.example tgcloud/lib/config.js
-# edit tgcloud/lib/config.js: WORKER_URL + COMMAND_API_SECRET
 
 npx wrangler secret put TELEGRAM_BOT_TOKEN
 npx wrangler secret put ADMIN_USER_ID
 npx wrangler secret put COMMAND_API_SECRET   # same value as config.js
-npx wrangler secret put INTERNAL_POLL_SECRET
+npx wrangler secret put DEFAULT_CHAT_ID
 npm run deploy:worker
-npx wrangler deploy --config wrangler-dispatcher.toml
-npx wrangler secret put INTERNAL_POLL_SECRET --config wrangler-dispatcher.toml
 npm run deploy:tgcloud
 ```
 
@@ -122,6 +119,13 @@ npm run deploy:tgcloud
 `tgcloud/lib/config.js` (the platform has no secret store, so the Serverless
 copy lives in deployed code, but it must never be committed). `deploy.sh` keeps
 both in sync automatically.
+
+Finally, log in the userbot and start the trigger (see
+[`userbot/README.md`](userbot/README.md)):
+
+```bash
+cd userbot && python login.py && python trigger.py --loop
+```
 
 ---
 
@@ -137,16 +141,15 @@ both in sync automatically.
 | `/admin <id>` | Grant admin | admin |
 | `/unadmin <id>` | Revoke admin | admin |
 
-The cron polls every **15 minutes** (`wrangler.toml` → `[triggers] crons`).
+The userbot polls every **15 minutes** by default (`userbot/.env` →
+`INTERVAL_SECONDS`).
 
-### KV write budget
+### Write budget
 
-The Workers **free plan allows 1,000 KV writes per day**. Poll status for all
-feeds is stored in one `feedMeta` key, so a poll costs **one write** (plus one
-write per newly seen article), not one write per feed. Adding a feed writes the
-feed record plus up to 30 "already seen" markers. Avoid reintroducing per-feed
-writes in the poll loop, or the daily limit will be exhausted before the day
-ends and `/add`, deduplication and metadata updates will fail until 00:00 UTC.
+SQLite on Telegram Serverless has no documented write quota, unlike the
+Cloudflare KV free plan this project moved off (1,000 writes/day). A poll still
+batches its writes: managed `seen` inserts in chunks of 200, one update per
+feed, and a single TTL cleanup.
 
 ---
 
@@ -159,15 +162,15 @@ Worker secrets (`wrangler secret put …`):
 | `TELEGRAM_BOT_TOKEN` | Bot API token (article cards) |
 | `ADMIN_USER_ID` | Comma-separated bootstrap admin IDs |
 | `COMMAND_API_SECRET` | Shared secret for `/api/*` |
-| `INTERNAL_POLL_SECRET` | Shared secret for the cron relay |
 | `DEFAULT_CHAT_ID` | Optional fixed channel/group target |
 
-Public Worker vars (`wrangler.toml` → `[vars]`): `WORKER_URL`, `DISPATCHER_URL`,
-and optionally `FETCH_OG_IMAGE = "false"` to skip the page-image fallback.
+Public Worker vars (`wrangler.toml` → `[vars]`): `WORKER_URL`, and optionally
+`FETCH_OG_IMAGE = "false"` to skip the page-image fallback.
 
-Serverless config: `tgcloud/lib/config.js` (`WORKER_URL`, `COMMAND_API_SECRET`).
-It is generated by `deploy.sh` from the committed `tgcloud/lib/config.example`
-and is git-ignored — do not commit the generated file.
+Serverless config: `tgcloud/lib/config.js` (`WORKER_URL`,
+`COMMAND_API_SECRET`, `DEFAULT_CHAT_ID`, `BOOTSTRAP_ADMIN_ID`). It is generated
+by `deploy.sh` from the committed `tgcloud/lib/config.example` and is
+git-ignored — do not commit the generated file.
 
 ---
 
@@ -175,15 +178,22 @@ and is git-ignored — do not commit the generated file.
 
 ```bash
 npm install
-npm test            # 111 unit tests: parser, images, Worker API, commands
+npm test            # parser, images, stateless Worker API, commands
 npm run typecheck   # strict TS for src/ + tests/
 
 npm run dev         # wrangler dev (Worker only)
-npx tgcloud run handlers/message '{ chat: { id: 1 }, from: { id: 111 }, text: "/list" }'
+
+# Serverless handlers use the platform DB; run them without deploying:
+npx tgcloud run handlers/message \
+  '{ chat: { id: 1 }, from: { id: 111 }, text: "/list" }'
+
+# Simulate the userbot scheduler (no Telethon needed):
+npx tgcloud run handlers/message \
+  '{ chat: { id: 1 }, from: { id: 779298050 }, text: "/check" }'
 ```
 
-`tgcloud run` executes the handler on the platform with your local files, so the
-Worker must be reachable for anything that touches feeds.
+The Worker must be deployed (or running under `wrangler dev`) for `/add` and
+`/check`, because the handlers call it.
 
 ---
 
@@ -191,12 +201,12 @@ Worker must be reachable for anything that touches feeds.
 
 - `MAX_SEND_PER_RUN` (20) and `MAX_ITEMS_PER_FEED` (30) keep each poll inside
   Workers limits.
-- `/api/check` keeps a full poll alive with `waitUntil`, but only waits ~20 s for
-  a summary. If the poll is still running, the command replies “Check started”
-  and the cards arrive on their own.
-- KV dedupe is check-then-set; the race window is negligible for a single cron.
-- Telegram Serverless has no documented execution-time or storage quotas and no
-  secret store. The command layer is deliberately stateless so that a platform
-  limit cannot take feed data with it.
+- `/api/poll` runs to completion under the Serverless handler and returns the
+  final summary, so `/check` waits for the result instead of fire-and-forget.
+- Seen dedupe is check-then-set; the race window is negligible for one poller.
+  The userbot trigger avoids overlapping runs.
+- Telegram Serverless has no cron and no public HTTP endpoint; keep polling in
+  the userbot and the feed engine on Cloudflare.
 - Rotate `CLOUDFLARE_API_TOKEN`, the bot token, and `TGCLOUD_TOKEN` if they have
-  ever been pasted into a chat or committed.
+  ever been pasted into a chat or committed. Never commit
+  `tgcloud/lib/config.js` or userbot `.session` files.

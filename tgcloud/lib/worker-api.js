@@ -1,30 +1,29 @@
 /**
- * Thin client for the Cloudflare Worker's /api/* routes.
+ * The two calls that still need the Cloudflare feed engine.
  *
- * The Serverless layer is stateless: feeds, seen items and admins live in
- * Cloudflare KV, and the Worker is the only thing that talks to Telegram for
- * article cards. Each method throws an Error whose message is safe to show to
- * the Telegram user.
+ * All persistent state lives in the Telegram Serverless database. The Worker
+ * is stateless: it fetches/parses feeds, sends cards, and returns the new
+ * article ids plus per-feed metadata for the caller to persist.
  */
 
 import { fetch } from "sdk";
 import { COMMAND_API_SECRET, WORKER_URL } from "./config.js";
 
-async function call(path, { method = "GET", body } = {}) {
+async function post(path, body) {
   const res = await fetch(`${WORKER_URL}/api${path}`, {
-    method,
+    method: "POST",
     headers: {
       Authorization: `Bearer ${COMMAND_API_SECRET}`,
-      ...(body ? { "Content-Type": "application/json" } : {}),
+      "Content-Type": "application/json",
     },
-    body: body ? JSON.stringify(body) : undefined,
+    body: JSON.stringify(body ?? {}),
   });
 
   let data = null;
   try {
     data = await res.json();
   } catch {
-    // Non-JSON error page (e.g. a Cloudflare 5xx) — fall through.
+    // A non-JSON error page (e.g. a Cloudflare 5xx) — use the status below.
   }
 
   if (!res.ok || data?.ok !== true) {
@@ -37,21 +36,16 @@ async function call(path, { method = "GET", body } = {}) {
   return data;
 }
 
-export const worker = {
-  getAdmins: () => call("/admins").then((data) => data.admins ?? []),
+/** Fetch/parse a feed, send the confirmation + preview, return its newest ids. */
+export async function previewFeed(url, chatId) {
+  const data = await post("/feed/preview", { url, chatId });
+  return data.feed;
+}
 
-  listFeeds: () => call("/feeds").then((data) => data.feeds ?? []),
-
-  addFeed: (url, chatId) =>
-    call("/feeds", { method: "POST", body: { url, chatId } }).then((data) => data.feed),
-
-  removeFeed: (arg, chatId) =>
-    call("/feeds/remove", { method: "POST", body: { arg, chatId } }).then(
-      (data) => data.removed,
-    ),
-
-  check: (chatId) => call("/check", { method: "POST", body: { chatId } }),
-
-  setAdmin: (userId, add) =>
-    call("/admins", { method: "POST", body: { userId, add } }).then((data) => data.admins),
-};
+/**
+ * Run a stateless poll on the Worker.
+ * @returns {{ summary: {feeds:number,sent:number,errors:number}, seen: string[], meta: object[] }}
+ */
+export async function pollFeeds(feeds, seen, chatId) {
+  return post("/poll", { feeds, seen, chatId });
+}

@@ -2,14 +2,15 @@
  * Template for tgcloud/lib/config.js.
  *
  * `deploy.sh` copies this file to `tgcloud/lib/config.js` and fills in the
- * Worker URL and the COMMAND_API_SECRET. The generated file is git-ignored
- * because it must stay in sync with the Worker secret and must never be
- * published. If you deploy the Serverless project by hand, copy this file
- * first.
+ * Worker URL, the command secret, the default destination chat, and the
+ * bootstrap admin ID(s). The generated file is git-ignored because it must
+ * stay in sync with the Worker secrets and must never be published.
  */
 
 export const WORKER_URL = "REPLACE_WITH_WORKER_URL";
 export const COMMAND_API_SECRET = "REPLACE_WITH_COMMAND_API_SECRET";
+export const DEFAULT_CHAT_ID = "REPLACE_WITH_DEFAULT_CHAT_ID";
+export const BOOTSTRAP_ADMIN_ID = "REPLACE_WITH_ADMIN_USER_ID";
 
 // Telegram rejects messages longer than 4096 characters.
 export const MAX_MESSAGE_CHARS = 3500;

@@ -2,6 +2,7 @@ import { describe, it, expect, vi, afterEach } from "vitest";
 import worker from "../src/index";
 
 const SECRET = "test-secret";
+const FEED_URL = "https://example.com/feed";
 
 const FEED_XML = `<?xml version="1.0" encoding="UTF-8"?>
 <rss version="2.0"><channel>
@@ -22,361 +23,199 @@ const FEED_XML = `<?xml version="1.0" encoding="UTF-8"?>
   </item>
 </channel></rss>`;
 
-function makeKv() {
-  const store = new Map<string, string>();
+function makeEnv(overrides: Record<string, unknown> = {}) {
   return {
-    store,
-    async get(key: string) {
-      return store.has(key) ? store.get(key)! : null;
-    },
-    async put(key: string, value: string) {
-      store.set(key, value);
-    },
-    async delete(key: string) {
-      store.delete(key);
-    },
-    async list({ prefix = "" }: { prefix?: string } = {}) {
-      return {
-        keys: [...store.keys()]
-          .filter((key) => key.startsWith(prefix))
-          .map((name) => ({ name })),
-        list_complete: true,
-        cursor: "",
-      };
-    },
-  };
+    TELEGRAM_BOT_TOKEN: "TOKEN",
+    ADMIN_USER_ID: "111",
+    COMMAND_API_SECRET: SECRET,
+    DEFAULT_CHAT_ID: "111",
+    FETCH_OG_IMAGE: "false",
+    ...overrides,
+  } as any;
 }
 
-function makeEnv() {
-  const feeds = makeKv();
-  const seen = makeKv();
-  const settings = makeKv();
-  return {
-    env: {
-      RSS_FEEDS: feeds,
-      RSS_SEEN: seen,
-      RSS_SETTINGS: settings,
-      TELEGRAM_BOT_TOKEN: "TOKEN",
-      ADMIN_USER_ID: "111",
-      COMMAND_API_SECRET: SECRET,
-      FETCH_OG_IMAGE: "false",
-    } as any,
-    feeds,
-    seen,
-    settings,
-  };
+function json(data: unknown, status = 200): Response {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
 }
 
-function makeCtx() {
-  const pending: Promise<unknown>[] = [];
-  return {
-    ctx: {
-      waitUntil(promise: Promise<unknown>) {
-        pending.push(promise);
-      },
-      passThroughOnException() {},
-    } as any,
-    pending,
-  };
+function mockFetch(feedResponse?: Response) {
+  vi.spyOn(globalThis, "fetch").mockImplementation(async (input: any) => {
+    const url = String(input);
+
+    if (url === FEED_URL) {
+      return (
+        feedResponse ??
+        new Response(FEED_XML, {
+          status: 200,
+          headers: { "Content-Type": "application/rss+xml" },
+        })
+      );
+    }
+
+    if (url.includes("api.telegram.org")) {
+      return json({ ok: true, result: { message_id: 1 } });
+    }
+
+    return json({ ok: false, description: `unexpected fetch ${url}` }, 500);
+  });
 }
 
-function apiRequest(path: string, init: RequestInit = {}, secret: string | null = SECRET) {
-  const headers: Record<string, string> = {};
+async function post(
+  path: string,
+  body: unknown,
+  env = makeEnv(),
+  secret: string | null = SECRET,
+): Promise<Response> {
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
   if (secret) headers.Authorization = `Bearer ${secret}`;
-  if (init.body) headers["Content-Type"] = "application/json";
-  return new Request(`https://bot.test${path}`, { ...init, headers });
+  return worker.fetch(
+    new Request(`https://bot.test${path}`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+    }),
+    env,
+  );
 }
 
-function callApi(path: string, init: RequestInit = {}, secret: string | null = SECRET) {
-  const { env } = makeEnv();
-  const { ctx } = makeCtx();
-  return { env, res: worker.fetch(apiRequest(path, init, secret), env, ctx) };
+async function get(path: string, env = makeEnv()): Promise<Response> {
+  return worker.fetch(new Request(`https://bot.test${path}`), env);
 }
 
 afterEach(() => vi.unstubAllGlobals());
 
+const feed = {
+  url: FEED_URL,
+  title: "Test Feed",
+  addedAt: 1,
+  lastChecked: 0,
+  lastError: null,
+  itemCount: 2,
+};
+
+function telegramCalls(): any[][] {
+  return (globalThis.fetch as any).mock.calls.filter(([url]: any[]) =>
+    String(url).includes("api.telegram.org"),
+  );
+}
+
 describe("command API auth", () => {
-  it("rejects a missing or wrong secret", async () => {
-    const noAuth = await callApi("/api/feeds", {}, null).res;
+  it("rejects missing or wrong command secrets", async () => {
+    mockFetch();
+    const noAuth = await post("/api/poll", {}, makeEnv(), null);
     expect(noAuth.status).toBe(401);
     expect(await noAuth.json()).toEqual({ ok: false, error: "Unauthorized" });
 
-    const wrong = await callApi("/api/feeds", {}, "nope").res;
+    const wrong = await post("/api/feed/preview", { url: FEED_URL }, makeEnv(), "nope");
     expect(wrong.status).toBe(401);
   });
 });
 
-describe("admins", () => {
-  it("lists the ADMIN_USER_ID", async () => {
-    const { env } = makeEnv();
-    const { ctx } = makeCtx();
-    const res = await worker.fetch(apiRequest("/api/admins"), env, ctx);
-    expect(await res.json()).toEqual({ ok: true, admins: [111] });
-  });
+describe("feed preview", () => {
+  it("fetches/parses a feed, sends confirmation + preview, returns seen hashes", async () => {
+    mockFetch();
 
-  it("adds and removes an admin in KV", async () => {
-    const { env, settings } = makeEnv();
-    const { ctx } = makeCtx();
-
-    const added = await worker.fetch(
-      apiRequest("/api/admins", { method: "POST", body: JSON.stringify({ userId: 222, add: true }) }),
-      env,
-      ctx,
-    );
-    expect(await added.json()).toEqual({ ok: true, admins: [111, 222], added: true });
-    expect(JSON.parse(settings.store.get("admins")!)).toEqual([111, 222]);
-
-    const removed = await worker.fetch(
-      apiRequest("/api/admins", { method: "POST", body: JSON.stringify({ userId: 111, add: false }) }),
-      env,
-      ctx,
-    );
-    expect(await removed.json()).toEqual({ ok: true, admins: [222], added: false });
-  });
-
-  it("rejects an invalid user id", async () => {
-    const { env } = makeEnv();
-    const { ctx } = makeCtx();
-    const res = await worker.fetch(
-      apiRequest("/api/admins", { method: "POST", body: JSON.stringify({ userId: "abc" }) }),
-      env,
-      ctx,
-    );
-    expect(res.status).toBe(400);
-  });
-});
-
-describe("feeds", () => {
-  it("starts empty", async () => {
-    const { env } = makeEnv();
-    const { ctx } = makeCtx();
-    const res = await worker.fetch(apiRequest("/api/feeds"), env, ctx);
-    expect(await res.json()).toEqual({ ok: true, feeds: [] });
-  });
-
-  it("adds a feed, stores it, and backfills seen ids", async () => {
-    const { env, feeds, seen } = makeEnv();
-    const { ctx } = makeCtx();
-
-    const fetchSpy = vi.fn(async (input: any) => {
-      const url = String(input);
-      if (url === "https://example.com/feed") {
-        return new Response(FEED_XML, { headers: { "content-type": "application/xml" } });
-      }
-      if (url.includes("api.telegram.org")) {
-        return new Response(JSON.stringify({ ok: true, result: { message_id: 1 } }), {
-          headers: { "content-type": "application/json" },
-        });
-      }
-      throw new Error(`unexpected fetch ${url}`);
-    });
-    vi.stubGlobal("fetch", fetchSpy);
-
-    const res = await worker.fetch(
-      apiRequest("/api/feeds", {
-        method: "POST",
-        body: JSON.stringify({ url: "example.com/feed", chatId: 999 }),
-      }),
-      env,
-      ctx,
-    );
-
+    const res = await post("/api/feed/preview", { url: FEED_URL, chatId: 111 });
     expect(res.status).toBe(200);
+
     const body: any = await res.json();
     expect(body.ok).toBe(true);
-    expect(body.feed).toMatchObject({
-      url: "https://example.com/feed",
-      title: "Test Feed",
-      itemCount: 2,
-    });
+    expect(body.feed.url).toBe(FEED_URL);
+    expect(body.feed.title).toBe("Test Feed");
+    expect(body.feed.itemCount).toBe(2);
+    expect(body.feed.seenIds).toHaveLength(2);
+    expect(body.feed.seenIds[0]).toMatch(/^[0-9a-f]{64}$/);
 
-    // One feed in RSS_FEEDS, two dedupe keys in RSS_SEEN.
-    expect([...feeds.store.keys()]).toEqual(["feed:https://example.com/feed"]);
-    expect([...seen.store.keys()]).toHaveLength(2);
-
-    // Confirmation + preview card are delegated to the Worker.
-    const telegramCalls = fetchSpy.mock.calls.filter(([url]) =>
-      String(url).includes("api.telegram.org"),
-    );
-    expect(telegramCalls).toHaveLength(2);
+    const calls = telegramCalls();
+    expect(calls).toHaveLength(2);
+    const texts = calls.map(([, init]: any[]) => JSON.parse(init.body).text);
+    expect(texts[0]).toContain("Feed added");
+    expect(texts[1]).toContain("Newest");
   });
 
-  it("accepts a negative group chat id", async () => {
-    const { env } = makeEnv();
-    const { ctx } = makeCtx();
-    const groupId = -1001234567890;
-
-    const fetchSpy = vi.fn(async (input: any, init?: any) => {
-      const url = String(input);
-      if (url === "https://example.com/feed") {
-        return new Response(FEED_XML, { headers: { "content-type": "application/xml" } });
-      }
-      if (url.includes("api.telegram.org")) {
-        return new Response(JSON.stringify({ ok: true, result: { message_id: 1 } }), {
-          headers: { "content-type": "application/json" },
-        });
-      }
-      throw new Error(`unexpected fetch ${url}`);
-    });
-    vi.stubGlobal("fetch", fetchSpy);
-
-    const res = await worker.fetch(
-      apiRequest("/api/feeds", {
-        method: "POST",
-        body: JSON.stringify({ url: "example.com/feed", chatId: groupId }),
-      }),
-      env,
-      ctx,
-    );
-
-    expect(res.status).toBe(200);
-    const telegramCalls = fetchSpy.mock.calls.filter(([url]) =>
-      String(url).includes("api.telegram.org"),
-    );
-    expect(telegramCalls.length).toBeGreaterThan(0);
-    for (const [, init] of telegramCalls) {
-      expect(JSON.parse(String(init.body)).chat_id).toBe(groupId);
-    }
+  it("rejects an invalid URL without fetching", async () => {
+    mockFetch();
+    const res = await post("/api/feed/preview", { url: "ftp://example.com/feed" });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({ ok: false, error: "❌ Invalid URL." });
   });
 
-  it("returns a clear error when the daily KV write limit is hit", async () => {
-    const { env, feeds } = makeEnv();
-    const { ctx } = makeCtx();
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () =>
-        new Response(FEED_XML, { headers: { "content-type": "application/xml" } }),
-      ),
-    );
-    vi.spyOn(env.RSS_SEEN, "put").mockRejectedValue(
-      new Error("KV put() limit exceeded for the day."),
-    );
-
-    const res = await worker.fetch(
-      apiRequest("/api/feeds", {
-        method: "POST",
-        body: JSON.stringify({ url: "example.com/feed" }),
-      }),
-      env,
-      ctx,
-    );
-
-    expect(res.status).toBe(503);
-    const body: any = await res.json();
-    expect(body.error).toMatch(/daily KV write limit/i);
-    // The feed record is written only after the seen backfill succeeds.
-    expect(feeds.store.size).toBe(0);
+  it("returns a clear error when the feed cannot be fetched", async () => {
+    mockFetch(new Response("nope", { status: 500 }));
+    const res = await post("/api/feed/preview", { url: FEED_URL });
+    expect(res.status).toBe(502);
+    expect(((await res.json()) as any).error).toMatch(/Could not fetch feed/);
   });
 
-  it("rejects a duplicate feed with 409", async () => {
-    const { env, feeds } = makeEnv();
-    const { ctx } = makeCtx();
-    feeds.store.set(
-      "feed:https://example.com/feed",
-      JSON.stringify({ url: "https://example.com/feed", title: "Test Feed" }),
-    );
-
-    const res = await worker.fetch(
-      apiRequest("/api/feeds", {
-        method: "POST",
-        body: JSON.stringify({ url: "https://example.com/feed" }),
+  it("rejects a document with no RSS/Atom items", async () => {
+    mockFetch(
+      new Response("<rss><channel><title>Empty</title></channel></rss>", {
+        status: 200,
+        headers: { "Content-Type": "application/rss+xml" },
       }),
-      env,
-      ctx,
     );
-
-    expect(res.status).toBe(409);
-    expect(await res.json()).toEqual({ ok: false, error: "⚠️ That feed is already added." });
-  });
-
-  it("removes a feed by 1-based index", async () => {
-    const { env, feeds } = makeEnv();
-    const { ctx } = makeCtx();
-    feeds.store.set(
-      "feed:https://example.com/feed",
-      JSON.stringify({ url: "https://example.com/feed", title: "Test Feed", addedAt: 1 }),
-    );
-
-    const res = await worker.fetch(
-      apiRequest("/api/feeds/remove", {
-        method: "POST",
-        body: JSON.stringify({ arg: "1" }),
-      }),
-      env,
-      ctx,
-    );
-
-    expect(await res.json()).toEqual({
-      ok: true,
-      removed: { url: "https://example.com/feed", title: "Test Feed" },
-    });
-    expect(feeds.store.size).toBe(0);
-  });
-
-  it("returns 404 when removing an unknown feed", async () => {
-    const { env } = makeEnv();
-    const { ctx } = makeCtx();
-    const res = await worker.fetch(
-      apiRequest("/api/feeds/remove", {
-        method: "POST",
-        body: JSON.stringify({ arg: "https://nope.test/feed" }),
-      }),
-      env,
-      ctx,
-    );
-    expect(res.status).toBe(404);
+    const res = await post("/api/feed/preview", { url: FEED_URL });
+    expect(res.status).toBe(422);
   });
 });
 
-describe("check", () => {
-  it("runs a poll with no feeds and reports the summary", async () => {
-    const { env } = makeEnv();
-    const { ctx } = makeCtx();
-    const res = await worker.fetch(
-      apiRequest("/api/check", { method: "POST", body: JSON.stringify({ chatId: 999 }) }),
-      env,
-      ctx,
-    );
-    expect(await res.json()).toEqual({ ok: true, feeds: 0, sent: 0, errors: 0 });
+describe("poll", () => {
+  it("returns an empty result when no feeds are supplied", async () => {
+    mockFetch();
+    const res = await post("/api/poll", { feeds: [], seen: [] });
+    expect(await res.json()).toEqual({
+      ok: true,
+      summary: { feeds: 0, sent: 0, errors: 0 },
+      seen: [],
+      meta: [],
+    });
   });
 
-  it("writes feed metadata once per poll instead of once per feed", async () => {
-    const { env, feeds, settings } = makeEnv();
-    const { ctx } = makeCtx();
-    const emptyFeed =
-      '<?xml version="1.0"?><rss version="2.0"><channel><title>Empty</title></channel></rss>';
+  it("sends unseen items and returns their ids plus metadata", async () => {
+    mockFetch();
 
-    feeds.store.set(
-      "feed:https://a.test/feed",
-      JSON.stringify({ url: "https://a.test/feed", title: "A", addedAt: 1 }),
-    );
-    feeds.store.set(
-      "feed:https://b.test/feed",
-      JSON.stringify({ url: "https://b.test/feed", title: "B", addedAt: 2 }),
-    );
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () =>
-        new Response(emptyFeed, { headers: { "content-type": "application/xml" } }),
-      ),
-    );
-    const putSpy = vi.spyOn(settings, "put");
+    const res = await post("/api/poll", { feeds: [feed], seen: [] });
+    const body: any = await res.json();
+    expect(body.ok).toBe(true);
+    expect(body.summary).toEqual({ feeds: 1, sent: 2, errors: 0 });
+    expect(body.seen).toHaveLength(2);
+    expect(body.seen.every((id: string) => /^[0-9a-f]{64}$/.test(id))).toBe(true);
+    expect(body.meta).toEqual([
+      { url: FEED_URL, lastChecked: expect.any(Number), lastError: null, itemCount: 2 },
+    ]);
 
-    const res = await worker.fetch(
-      apiRequest("/api/check", { method: "POST", body: JSON.stringify({ chatId: 999 }) }),
-      env,
-      ctx,
-    );
-
-    expect(await res.json()).toEqual({ ok: true, feeds: 2, sent: 0, errors: 0 });
-    expect(putSpy).toHaveBeenCalledTimes(1);
-    expect(putSpy.mock.calls[0][0]).toBe("feedMeta");
+    expect(telegramCalls()).toHaveLength(2);
   });
 
-  it("rejects an unknown route", async () => {
-    const { env } = makeEnv();
-    const { ctx } = makeCtx();
-    const res = await worker.fetch(apiRequest("/api/nope"), env, ctx);
-    expect(res.status).toBe(404);
+  it("does not resend articles that are already seen", async () => {
+    mockFetch();
+    const first = await post("/api/poll", { feeds: [feed], seen: [] });
+    const seen = ((await first.json()) as any).seen;
+
+    const second = await post("/api/poll", { feeds: [feed], seen });
+    const body: any = await second.json();
+    expect(body.summary).toEqual({ feeds: 1, sent: 0, errors: 0 });
+    expect(body.seen).toEqual([]);
+  });
+
+  it("records a feed fetch error without failing the poll", async () => {
+    mockFetch(new Response("blocked", { status: 526 }));
+
+    const res = await post("/api/poll", { feeds: [feed], seen: [] });
+    const body: any = await res.json();
+    expect(body.summary).toEqual({ feeds: 1, sent: 0, errors: 1 });
+    expect(body.meta[0]).toMatchObject({ url: FEED_URL, lastError: expect.any(String) });
+  });
+});
+
+describe("root", () => {
+  it("describes the stateless feed engine", async () => {
+    mockFetch();
+    const res = await get("/");
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain("feed engine is running");
   });
 });

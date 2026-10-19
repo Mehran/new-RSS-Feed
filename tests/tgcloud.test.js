@@ -154,7 +154,7 @@ describe("handleMessage", () => {
     await handleMessage(message("/unadmin 42"), { api, worker });
 
     expect(worker.setAdmin).toHaveBeenCalledWith(42, false);
-    expect(api.sendMessage.mock.calls[0][0].text).toContain("ADMIN_USER_ID");
+    expect(api.sendMessage.mock.calls[0][0].text).toContain("BOOTSTRAP_ADMIN_ID");
   });
 
   it("removes a KV-managed admin normally", async () => {

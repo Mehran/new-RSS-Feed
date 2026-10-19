@@ -9,16 +9,18 @@ A Telegram RSS feed reader bot with two deployments:
 
 | Part | Runtime | Responsibility |
 |------|---------|----------------|
-| `tgcloud/` | **Telegram Serverless** (V8 isolate, no npm) | Receives Telegram updates, parses `/add`, `/remove`, `/list`, `/check`, `/admin`, `/unadmin`, authorizes the sender, formats replies. **Stateless.** |
-| `src/` | **Cloudflare Worker** | Owns Cloudflare KV, fetches/parses feeds, extracts images, sends article cards, and runs the cron poll. Also exposes the authenticated `/api/*` routes the Serverless layer calls. |
+| `tgcloud/` | **Telegram Serverless** (V8 isolate, no npm) | Receives Telegram updates, parses `/add`, `/remove`, `/list`, `/check`, `/admin`, `/unadmin`, authorizes the sender, formats replies, and owns SQLite state (feeds, seen items, admins). |
+| `src/` | **Cloudflare Worker** | **Stateless** feed engine: fetches/parses feeds, extracts images, sends article cards, and exposes the authenticated `/api/feed/preview` and `/api/poll` routes. No KV, no cron, no state. |
 
-Telegram Serverless has **no cron and no public HTTP endpoint**. The cron must
-stay on Cloudflare (see `wrangler.toml` and `src/dispatcher.ts`). Do not try to
-move polling into `tgcloud/`.
+Telegram Serverless has **no cron and no public HTTP endpoint** — its endpoints
+are only callable by a Telegram user inside the bot's Mini App, so there is no
+server-to-server API. Polling is therefore scheduled by a Telethon **userbot**
+(`userbot/`) that sends `/check`; the Serverless handler drives the poll and
+persists the results. Do not try to move the feed-fetching/sending engine into
+`tgcloud/`, and do not try to make the Worker call Serverless or own state.
 
-There is no shared database: feeds, seen items and admins live only in
-Cloudflare KV. `tgcloud/schema.js` exists for project validity and future state;
-it is not used by the command handlers.
+Feeds, seen items and admins live only in Telegram Serverless SQLite. The Worker
+never reads or writes them: every `/api/poll` request is fully parameterised.
 
 ## Layout
 
@@ -26,18 +28,22 @@ it is not used by the command handlers.
   updates to it; it delegates to `lib/command.js`.
 - `tgcloud/lib/command.js` — command routing. `api` and `worker` are injected,
   so it is testable with fakes.
+- `tgcloud/lib/store.js` — SQLite state and poll orchestration: reads feeds and
+  seen ids, calls `pollFeeds()`, writes back delivered ids and feed metadata.
 - `tgcloud/lib/worker-api.js` — the only place that talks to the Worker.
 - `tgcloud/lib/format.js` — pure formatting/parsing helpers.
-- `tgcloud/lib/config.js` — generated, git-ignored: `WORKER_URL` and
-  `COMMAND_API_SECRET`. The platform has no secret store, so the shared secret
-  lives here and must match the Worker's `COMMAND_API_SECRET` secret. The
-  committed template is `tgcloud/lib/config.example`; `deploy.sh` creates the
-  real file. Never commit it (the repository is public).
-- `src/index.ts` — Worker entry: `/api/*` routes, `/internal/check`, cron.
-- `src/dispatcher.ts` — cron relay (a Worker cannot fetch its own URL; a
-  free-plan cron is capped at 10 ms CPU).
-- `tests/` — Vitest. Worker tests use a fake KV; command tests use fake
-  `api`/`worker` objects.
+- `tgcloud/lib/config.js` — generated, git-ignored: `WORKER_URL`,
+  `COMMAND_API_SECRET`, `DEFAULT_CHAT_ID`, `BOOTSTRAP_ADMIN_ID`. The platform has
+  no secret store, so the shared secret lives here and must match the Worker's
+  `COMMAND_API_SECRET` secret. The committed template is
+  `tgcloud/lib/config.example`; `deploy.sh` creates the real file. Never commit
+  it (the repository is public).
+- `tgcloud/schema.js` — `feeds`, `seen`, `admins` tables (the source of truth).
+- `src/index.ts` — Worker entry: `/api/*` routes only. Stateless.
+- `userbot/trigger.py` — Telethon `/check` scheduler; `userbot/login.py` creates
+  its session. Never commit `userbot/*.session` or `userbot/.env`.
+- `tests/` — Vitest. Worker tests mock `fetch` (the Worker has no storage);
+  command tests use fake `api`/`worker` objects.
 
 ## Rules that bite
 
@@ -53,19 +59,26 @@ it is not used by the command handlers.
   versa. `./deploy.sh` does both.
 - Deploy order matters: deploy the Worker first (it adds `/api/*`), then push
   the Serverless project (which moves the Telegram webhook to the platform).
-- The free KV plan allows **1,000 writes/day**. Never write per-feed status in
-  the poll loop; `feedMeta` in `RSS_SETTINGS` is written once per poll. Adding a
-  feed also writes up to 30 seen markers. Exceeding the limit breaks `/add` and
-  deduplication until 00:00 UTC.
+- `/api/poll` is at-most-once by design: the Worker records an item as seen
+  before sending. Failed sends are not returned in `seen`, so a retry can resend
+  them; a crash after a successful send would drop them. Keep it that way.
+- The `/check` sender must be an admin. Add the userbot's numeric id to
+  `BOOTSTRAP_ADMIN_ID` (`deploy.sh` fills it from `ADMIN_USER_ID`) or via
+  `/admin`.
+- There is no Cloudflare KV anymore. If `wrangler.toml` regains a
+  `[[kv_namespaces]]` block, `deploy.sh` refuses to run.
+- The Worker must not grow state or a cron: the whole point of the split is that
+  Telegram Serverless owns state and scheduling.
 
 ## Commands
 
 ```bash
 npm test                     # Worker + Serverless unit tests
 npm run typecheck            # tsc --noEmit for src/ and tests/
-npm run deploy:worker        # wrangler deploy (cron + API)
+npm run deploy:worker        # wrangler deploy (API only)
 npm run deploy:tgcloud       # tgcloud push (+ migrate)
 npm run deploy               # both, Worker first
+python userbot/trigger.py --loop   # local scheduler (after login.py)
 ```
 
 Full SDK reference: [docs/tgcloud-sdk.md](docs/tgcloud-sdk.md).

@@ -1,24 +1,20 @@
 /**
- * Telegram RSS Feed Reader Bot — Cloudflare Worker (engine)
- * ========================================================
+ * Telegram RSS Feed Reader Bot — Cloudflare Worker (feed engine)
+ * ==============================================================
  *
  * The project is split across two runtimes:
- *   - Telegram Serverless (tgcloud/) receives Telegram updates and handles the
- *     bot commands. It is stateless and calls the /api/* routes below.
- *   - This Worker owns state, polling and message delivery:
- *       /api/*            authenticated JSON API used by the Serverless layer
- *       /internal/check   a full polling run (the cron relay target)
- *       scheduled         cron trigger -> dispatcher -> /internal/check
+ *   - Telegram Serverless (tgcloud/) receives Telegram updates, handles the bot
+ *     commands, owns the SQLite state (feeds, seen items, admins), and triggers
+ *     polls through the userbot scheduler.
+ *   - This Worker is now stateless: it fetches/parses feeds, sends article
+ *     cards, and exposes only two authenticated engine calls:
+ *       /api/feed/preview  fetch/parse a new feed + send confirmation/card
+ *       /api/poll          fetch/parse feeds with a supplied seen set and
+ *                          return the new ids + per-feed metadata
  *
- * Telegram Serverless has no cron and no public HTTP endpoint, which is why
- * polling stays here.
- *
- * State lives in Cloudflare KV:
- *       RSS_FEEDS    -> feed URL -> { url, title, addedAt, ... }
- *       RSS_SEEN     -> sha256(article id) -> timestamp (with TTL, auto-expires)
- *       RSS_SETTINGS -> "admins" -> JSON array of authorized admin user IDs
- *                       "feedMeta" -> per-feed poll status (ONE write per poll,
- *                       because the free plan allows 1,000 writes/day)
+ * There is no cron trigger and no Worker-to-Serverless call. The Serverless
+ * `/check` handler reads its SQLite state, calls /api/poll, then writes the
+ * returned seen ids and feed metadata back to SQLite.
  *
  * Message card layout (HTML parse mode):
  *       <b>Title</b>
@@ -33,13 +29,8 @@ import { XMLParser } from "fast-xml-parser";
 /* ============================== Types ============================== */
 
 interface Env {
-  RSS_FEEDS: KVNamespace;
-  RSS_SEEN: KVNamespace;
-  RSS_SETTINGS: KVNamespace;
   TELEGRAM_BOT_TOKEN: string;
   ADMIN_USER_ID: string;
-  // Legacy fallback for INTERNAL_POLL_SECRET; no longer set by deploy.sh.
-  WEBHOOK_SECRET?: string;
   DEFAULT_CHAT_ID?: string;
   FETCH_OG_IMAGE?: string;
   // Shared secret for the /api/* routes. The Telegram Serverless handlers send
@@ -49,35 +40,12 @@ interface Env {
   // Public URL of this Worker (e.g. https://telegram-rss-bot.<subdomain>.workers.dev).
   // Informational: the Telegram webhook is managed by Telegram Serverless now.
   WORKER_URL?: string;
-  // Dedicated secret for the /internal/check endpoint. The cron trigger cannot
-  // fetch this Worker's own URL (Cloudflare error 1042: a Worker may not invoke
-  // itself), so the scheduled handler instead pings a separate "dispatcher"
-  // Worker, which calls back into /internal/check. INTERNAL_POLL_SECRET is
-  // shared between this Worker and the dispatcher. Falls back to WEBHOOK_SECRET
-  // for backwards compatibility.
-  INTERNAL_POLL_SECRET?: string;
-  // URL of the dispatcher Worker (https://rss-dispatcher.<subdomain>.workers.dev).
-  // The cron trigger POSTs to its /trigger endpoint, which relays the request
-  // back here as a normal HTTP fetch (NOT bound by the 10ms Cron CPU cap on the
-  // free plan). If unset, scheduled polling is skipped.
-  DISPATCHER_URL?: string;
 }
 
 interface FeedInfo {
   url: string;
   title: string;
   addedAt: number;
-  lastChecked: number;
-  lastError: string | null;
-  itemCount?: number;
-}
-
-/**
- * Per-feed poll status is kept in ONE KV key. Updating every feed record after
- * every poll (21 feeds x 96 runs/day) exhausted the free plan's 1,000 KV
- * writes/day before the day was over, which also broke /add and seen tracking.
- */
-interface FeedMetaEntry {
   lastChecked: number;
   lastError: string | null;
   itemCount?: number;
@@ -92,23 +60,23 @@ interface ArticleItem {
   raw: any; // original parsed XML node (for media/enclosure extraction)
 }
 
-interface TelegramUpdate {
-  update_id: number;
-  message?: TelegramMessage;
-  edited_message?: TelegramMessage;
-}
-
-interface TelegramMessage {
-  message_id: number;
-  chat: { id: number; type?: string };
-  from?: { id: number; username?: string; first_name?: string };
-  text?: string;
-}
-
 interface CheckSummary {
   feeds: number;
   sent: number;
   errors: number;
+}
+
+interface MetaUpdate {
+  url: string;
+  lastChecked: number;
+  lastError: string | null;
+  itemCount?: number;
+}
+
+interface PollResult {
+  summary: CheckSummary;
+  seen: string[];
+  meta: MetaUpdate[];
 }
 
 /* ============================= Constants ============================= */
@@ -119,7 +87,6 @@ const PAGE_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 const MAX_ITEMS_PER_FEED = 30; // only inspect the newest N items per feed
 const MAX_SEND_PER_RUN = 20; // hard cap on messages per check, protects limits
-const SEEN_TTL_SECONDS = 60 * 60 * 24 * 30; // auto-expire seen entries after 30 days
 const BODY_MAX = 300; // cleaned summary length before truncation
 const CAPTION_MAX = 950; // Telegram photo captions cap at 1024; keep a safety margin
 
@@ -135,11 +102,10 @@ const xmlParser = new XMLParser({
   // We intentionally do NOT let the parser expand XML entities. Large Persian
   // feeds (e.g. zoomit.ir) carry tens of thousands of numeric char references
   // (&#8204; zero-width non-joiner, etc.), and fast-xml-parser's entity
-  // expansion is single-threaded, synchronous CPU work that runs inside the
-  // `scheduled` handler. On the Workers free plan a Cron Trigger is capped at
-  // 10 ms of CPU, so that expansion alone repeatedly exhausted the budget and
-  // the invocation was killed with outcome `exceededResources` — meaning the
-  // news never got sent and there was no retry.
+  // expansion is single-threaded, synchronous CPU work. Parsing several such
+  // feeds in one /api/poll request repeatedly exhausted the Worker CPU budget
+  // and the invocation was killed with outcome `exceededResources` — meaning
+  // the news never got sent and there was no retry.
   //
   // Instead, we keep raw literal text (entities un-decoded) and decode only the
   // little bit we actually use (see decodeEntities / canonicalId). This makes
@@ -541,15 +507,6 @@ async function sha256Hex(text: string): Promise<string> {
   return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-function fnv1a(str: string): string {
-  let h = 0x811c9dc5;
-  for (let i = 0; i < str.length; i++) {
-    h ^= str.charCodeAt(i);
-    h = Math.imul(h, 0x01000193);
-  }
-  return (h >>> 0).toString(16);
-}
-
 /* ======================== Telegram API helpers ======================== */
 
 async function callApi(
@@ -664,72 +621,6 @@ export async function sendPhotoUpload(
     throw new Error(`Telegram sendPhoto failed (${res.status}): ${data.description ?? "unknown"}`);
   }
   return data.result;
-}
-
-/* ======================== KV storage helpers ======================== */
-
-function feedKey(url: string): string {
-  const u = normalizeUrl(url);
-  return u.length <= 450 ? `feed:${u}` : `feed:h:${fnv1a(u)}`;
-}
-
-const FEED_META_KEY = "feedMeta";
-
-async function getFeedMeta(env: Env): Promise<Record<string, FeedMetaEntry>> {
-  const raw = await env.RSS_SETTINGS.get(FEED_META_KEY);
-  if (!raw) return {};
-  try {
-    const value = JSON.parse(raw);
-    return value && typeof value === "object" ? value : {};
-  } catch {
-    return {};
-  }
-}
-
-async function putFeedMeta(
-  env: Env,
-  meta: Record<string, FeedMetaEntry>,
-): Promise<void> {
-  await env.RSS_SETTINGS.put(FEED_META_KEY, JSON.stringify(meta));
-}
-
-async function listFeeds(env: Env): Promise<FeedInfo[]> {
-  const meta = await getFeedMeta(env);
-  const feeds: FeedInfo[] = [];
-  let cursor: string | undefined;
-  do {
-    const res = await env.RSS_FEEDS.list({ prefix: "feed:", cursor, limit: 100 });
-    for (const k of res.keys) {
-      const raw = await env.RSS_FEEDS.get(k.name);
-      if (!raw) continue;
-      try {
-        const feed = JSON.parse(raw) as FeedInfo;
-        // Prefer the consolidated status; fall back to the legacy per-feed
-        // fields for feeds that have not been polled since this change.
-        const status = meta[k.name];
-        if (status) {
-          feed.lastChecked = status.lastChecked;
-          feed.lastError = status.lastError;
-          if (status.itemCount !== undefined) feed.itemCount = status.itemCount;
-        }
-        feeds.push(feed);
-      } catch {
-        /* ignore malformed entries */
-      }
-    }
-    cursor = res.list_complete ? undefined : res.cursor;
-  } while (cursor);
-  return feeds.sort((a, b) => a.addedAt - b.addedAt);
-}
-
-async function isSeen(env: Env, rawId: string): Promise<boolean> {
-  const key = `seen:${await sha256Hex(canonicalId(rawId))}`;
-  return (await env.RSS_SEEN.get(key)) !== null;
-}
-
-async function markSeen(env: Env, rawId: string): Promise<void> {
-  const key = `seen:${await sha256Hex(canonicalId(rawId))}`;
-  await env.RSS_SEEN.put(key, String(Date.now()), { expirationTtl: SEEN_TTL_SECONDS });
 }
 
 /* ======================== Feed fetching / polling ======================== */
@@ -847,12 +738,21 @@ async function sendArticle(
   return true;
 }
 
-/** Process one feed: send new items (up to `budget`) and mark them seen. */
+/**
+ * Process one feed: send unseen items (up to `budget`) and collect their ids.
+ *
+ * The seen set is modified in place and `newSeen` collects this run's ids. An
+ * id is added before sending and rolled back if the send throws, so a
+ * successfully delivered article is never delivered twice, while a failed send
+ * is retried on the next poll.
+ */
 async function processFeed(
   env: Env,
   feed: FeedInfo,
   chatId: number,
   budget: number,
+  seenSet: Set<string>,
+  newSeen: string[],
 ): Promise<{ sent: number; itemCount: number }> {
   const parsed = await fetchAndParse(feed.url);
   const items = extractItems(parsed).slice(0, MAX_ITEMS_PER_FEED);
@@ -861,59 +761,66 @@ async function processFeed(
   for (const item of items) {
     const rawId = getItemRawId(item);
     if (!rawId) continue;
-    if (await isSeen(env, rawId)) continue; // already posted
+    const itemId = await sha256Hex(canonicalId(rawId));
+    if (seenSet.has(itemId)) continue; // already posted
     if (sent >= budget) break;
-    // Write before sending: if the daily KV write limit is reached, skip the
-    // article instead of posting it again on every poll (at-most-once).
-    await markSeen(env, rawId);
-    await sendArticle(env, chatId, item, feed.title);
-    sent++;
+    seenSet.add(itemId);
+    newSeen.push(itemId);
+    try {
+      await sendArticle(env, chatId, item, feed.title);
+      sent++;
+    } catch (err) {
+      // Keep the item unseen so the next poll retries it.
+      seenSet.delete(itemId);
+      newSeen.pop();
+      throw err;
+    }
   }
 
   return { sent, itemCount: items.length };
 }
 
-async function checkAllFeeds(env: Env, chatId: number): Promise<CheckSummary> {
-  const feeds = await listFeeds(env);
-  const meta = await getFeedMeta(env);
-  const summary: CheckSummary = { feeds: feeds.length, sent: 0, errors: 0 };
-  const currentKeys = new Set(feeds.map((feed) => feedKey(feed.url)));
-  for (const key of Object.keys(meta)) {
-    if (!currentKeys.has(key)) delete meta[key]; // prune removed feeds
+/**
+ * Stateless poll: fetch/parse the supplied feeds, send new article cards, and
+ * return the ids that were delivered plus the per-feed metadata. The caller
+ * (Telegram Serverless) owns persistence.
+ */
+async function pollFeeds(
+  env: Env,
+  feeds: FeedInfo[],
+  seen: string[],
+  chatId?: number,
+): Promise<PollResult> {
+  const target = getTargetChatId(env, chatId);
+  if (!target) {
+    throw new ApiError("No target chat configured (set DEFAULT_CHAT_ID or ADMIN_USER_ID).", 409);
   }
 
+  const seenSet = new Set(seen);
+  const newSeen: string[] = [];
+  const meta: MetaUpdate[] = [];
+  const summary: CheckSummary = { feeds: feeds.length, sent: 0, errors: 0 };
   let budget = MAX_SEND_PER_RUN;
-  let processed = 0;
 
   for (const feed of feeds) {
     if (budget <= 0) break;
-    const key = feedKey(feed.url);
     try {
-      const { sent, itemCount } = await processFeed(env, feed, chatId, budget);
+      const { sent, itemCount } = await processFeed(env, feed, target, budget, seenSet, newSeen);
       summary.sent += sent;
       budget -= sent;
-      meta[key] = { lastChecked: Date.now(), lastError: null, itemCount };
+      meta.push({ url: feed.url, lastChecked: Date.now(), lastError: null, itemCount });
     } catch (err) {
       summary.errors++;
-      meta[key] = {
+      meta.push({
+        url: feed.url,
         lastChecked: Date.now(),
         lastError: String((err as Error)?.message ?? err).slice(0, 200),
-        itemCount: meta[key]?.itemCount,
-      };
+        itemCount: feed.itemCount,
+      });
     }
-    processed++;
   }
 
-  // One write per poll, not one per feed. A failure here must not hide the
-  // fact that articles were already delivered.
-  if (processed > 0) {
-    try {
-      await putFeedMeta(env, meta);
-    } catch (err) {
-      console.error("Failed to persist feed metadata:", err);
-    }
-  }
-  return summary;
+  return { summary, seen: newSeen, meta };
 }
 
 /* ====================== Admin authorization ====================== */
@@ -925,19 +832,6 @@ function envAdminIds(env: Env): number[] {
     .filter((n) => Number.isFinite(n) && n > 0);
 }
 
-async function getAdmins(env: Env): Promise<number[]> {
-  const ids = new Set(envAdminIds(env));
-  const raw = await env.RSS_SETTINGS.get("admins");
-  if (raw) {
-    try {
-      for (const id of JSON.parse(raw)) if (typeof id === "number") ids.add(id);
-    } catch {
-      /* ignore malformed admins */
-    }
-  }
-  return [...ids];
-}
-
 /**
  * Telegram chat IDs are negative for groups and channels, so never require a
  * positive number here. `0` is not a valid chat ID.
@@ -947,27 +841,24 @@ function parseChatId(value: unknown): number | undefined {
   return Number.isSafeInteger(n) && n !== 0 ? n : undefined;
 }
 
-async function getTargetChatId(
+function getTargetChatId(
   env: Env,
   fallbackChatId?: number,
-): Promise<number | undefined> {
-  const configured = parseChatId(env.DEFAULT_CHAT_ID);
-  if (configured) return configured;
-
-  const fallback = parseChatId(fallbackChatId);
-  if (fallback) return fallback;
-
-  // ADMIN_USER_ID may only cover the bootstrap admin; also consult KV so the
-  // cron still has a recipient after admins are managed with /admin.
-  return (await getAdmins(env))[0];
+): number | undefined {
+  // Prefer an explicit destination. ADMIN_USER_ID is the bootstrap recipient
+  // when the Serverless config does not send a chatId.
+  return (
+    parseChatId(env.DEFAULT_CHAT_ID) ??
+    parseChatId(fallbackChatId) ??
+    envAdminIds(env)[0]
+  );
 }
 
 /* =================== Command API (Telegram Serverless) =================== */
 
 /**
- * Bot commands now run on Telegram Serverless (see tgcloud/). Those handlers
- * are stateless: they authorize the Telegram user, then call these JSON
- * endpoints to read/write KV and trigger a poll.
+ * Bot commands now run on Telegram Serverless (see tgcloud/). Feeds, seen items
+ * and admins live there; the Worker exposes only the feed engine calls below.
  *
  * Every route requires the shared COMMAND_API_SECRET (Workers secret + the
  * matching constant in tgcloud/lib/config.js).
@@ -1002,20 +893,16 @@ async function readJson(request: Request): Promise<Record<string, any>> {
   }
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-/** Add a feed, mark its current items as seen, and optionally send a preview. */
-async function addFeed(env: Env, rawUrl: string, chatId?: number) {
+/**
+ * Fetch/parse a new feed, send the add confirmation + first article card, and
+ * return the hashes of its current items. The Serverless store inserts the
+ * feed and marks those hashes seen, so history is never replayed.
+ */
+async function previewFeed(env: Env, rawUrl: string, chatId?: number) {
   if (!rawUrl) throw new ApiError("Usage: /add <url>", 400);
 
   const url = normalizeUrl(rawUrl);
   if (!/^https?:\/\//i.test(url)) throw new ApiError("❌ Invalid URL.", 400);
-
-  if (await env.RSS_FEEDS.get(feedKey(url))) {
-    throw new ApiError("⚠️ That feed is already added.", 409);
-  }
 
   let parsed: any;
   try {
@@ -1033,38 +920,15 @@ async function addFeed(env: Env, rawUrl: string, chatId?: number) {
   }
 
   const title = stripHtml(extractFeedTitle(parsed)) || url;
-  const feed: FeedInfo = {
-    url,
-    title,
-    addedAt: Date.now(),
-    lastChecked: Date.now(),
-    lastError: null,
-    itemCount: items.length,
-  };
-  // Backfill-silence: existing items are marked as read so history isn't
-  // spammed. Do this before storing the feed, so a failed write (for example
-  // the daily KV limit) cannot leave a feed that re-sends its history.
+  const seenIds: string[] = [];
   for (const item of items.slice(0, MAX_ITEMS_PER_FEED)) {
     const rawId = getItemRawId(item);
-    if (rawId) await markSeen(env, rawId);
-  }
-
-  await env.RSS_FEEDS.put(feedKey(url), JSON.stringify(feed));
-  try {
-    const meta = await getFeedMeta(env);
-    meta[feedKey(url)] = {
-      lastChecked: feed.lastChecked,
-      lastError: null,
-      itemCount: items.length,
-    };
-    await putFeedMeta(env, meta);
-  } catch (err) {
-    console.error("feed added, but metadata write failed:", err);
+    if (rawId) seenIds.push(await sha256Hex(canonicalId(rawId)));
   }
 
   if (chatId) {
-    // Confirmation and preview are Telegram messages, so they stay in the
-    // Worker — the only place that knows how to build an article card.
+    // Confirmation and preview are Telegram messages, so they stay here — the
+    // only place that knows how to build an article card.
     try {
       await sendMessage(
         env,
@@ -1079,52 +943,11 @@ async function addFeed(env: Env, rawUrl: string, chatId?: number) {
     }
   }
 
-  return { url, title, itemCount: items.length };
-}
-
-/** Remove a feed by 1-based /list index or by URL. */
-async function removeFeed(env: Env, arg: string) {
-  if (!arg) throw new ApiError("Usage: /remove <url> or /remove <index>", 400);
-
-  if (/^\d+$/.test(arg)) {
-    const feeds = await listFeeds(env);
-    const feed = feeds[Number(arg) - 1];
-    if (!feed) throw new ApiError("❌ No feed at that index.", 404);
-    await env.RSS_FEEDS.delete(feedKey(feed.url));
-    return { url: feed.url, title: feed.title };
-  }
-
-  const url = normalizeUrl(arg);
-  const existing = await env.RSS_FEEDS.get(feedKey(url));
-  if (!existing) {
-    throw new ApiError("❌ Feed not found. Use /list to see active feeds.", 404);
-  }
-  let title = url;
-  try {
-    title = (JSON.parse(existing) as FeedInfo).title || url;
-  } catch {
-    /* keep the URL as the title */
-  }
-  await env.RSS_FEEDS.delete(feedKey(url));
-  return { url, title };
-}
-
-/** Update the admin list in KV and return the new list. */
-async function setAdmin(env: Env, userId: number, add: boolean): Promise<number[]> {
-  const admins = new Set(await getAdmins(env));
-  if (add) admins.add(userId);
-  else admins.delete(userId);
-  const list = [...admins];
-  await env.RSS_SETTINGS.put("admins", JSON.stringify(list));
-  return list;
+  return { url, title, itemCount: items.length, seenIds };
 }
 
 /** Routes under /api/*, called by the Telegram Serverless command handlers. */
-async function handleCommandApi(
-  request: Request,
-  env: Env,
-  ctx: ExecutionContext,
-): Promise<Response> {
+async function handleCommandApi(request: Request, env: Env): Promise<Response> {
   const expected = env.COMMAND_API_SECRET;
   const auth = request.headers.get("Authorization") ?? "";
   if (!expected || auth !== `Bearer ${expected}`) {
@@ -1136,28 +959,9 @@ async function handleCommandApi(
   const method = request.method;
 
   try {
-    if (route === "/admins" && method === "GET") {
-      return apiJson({ ok: true, admins: await getAdmins(env) });
-    }
-
-    if (route === "/admins" && method === "POST") {
+    if (route === "/feed/preview" && method === "POST") {
       const body = await readJson(request);
-      const userId = Number(body.userId);
-      if (!Number.isInteger(userId) || userId <= 0) {
-        return apiError("Usage: /admin <user_id>", 400);
-      }
-      const add = body.add !== false;
-      const admins = await setAdmin(env, userId, add);
-      return apiJson({ ok: true, admins, added: add });
-    }
-
-    if (route === "/feeds" && method === "GET") {
-      return apiJson({ ok: true, feeds: await listFeeds(env) });
-    }
-
-    if (route === "/feeds" && method === "POST") {
-      const body = await readJson(request);
-      const feed = await addFeed(
+      const feed = await previewFeed(
         env,
         String(body.url ?? ""),
         parseChatId(body.chatId),
@@ -1165,136 +969,50 @@ async function handleCommandApi(
       return apiJson({ ok: true, feed });
     }
 
-    if (route === "/feeds/remove" && method === "POST") {
+    if (route === "/poll" && method === "POST") {
       const body = await readJson(request);
-      const removed = await removeFeed(env, String(body.arg ?? ""));
-      return apiJson({ ok: true, removed });
-    }
+      const feeds = Array.isArray(body.feeds)
+        ? (body.feeds.filter(
+            (feed: any) =>
+              feed && typeof feed.url === "string" && feed.url.trim().length > 0,
+          ) as FeedInfo[])
+        : [];
+      const seen = Array.isArray(body.seen)
+        ? body.seen.filter((id: unknown) => typeof id === "string")
+        : [];
 
-    if (route === "/check" && method === "POST") {
-      const body = await readJson(request);
-      const target = await getTargetChatId(env, parseChatId(body.chatId));
-      if (!target) {
-        return apiError(
-          "❌ No target chat configured (set DEFAULT_CHAT_ID or ADMIN_USER_ID).",
-          409,
-        );
+      if (feeds.length === 0) {
+        return apiJson({ ok: true, summary: { feeds: 0, sent: 0, errors: 0 }, seen: [], meta: [] });
       }
 
-      // A full poll can outlive the Serverless handler's budget. Keep it alive
-      // with waitUntil, but wait only ~20s for a summary; otherwise report that
-      // it is still running (the article cards arrive on their own).
-      const run = checkAllFeeds(env, target);
-      ctx.waitUntil(run.catch((err) => console.error("API check failed:", err)));
-      const summary = await Promise.race([run, sleep(20_000).then(() => null)]);
-      if (!summary) return apiJson({ ok: true, pending: true });
-      return apiJson({ ok: true, ...summary });
+      const result = await pollFeeds(env, feeds, seen, parseChatId(body.chatId));
+      return apiJson({ ok: true, ...result });
     }
 
     return apiError("Not found", 404);
   } catch (err) {
     if (err instanceof ApiError) return apiError(err.message, err.status);
-    const message = String((err as Error)?.message ?? err);
-    if (/KV put\(\) limit exceeded/i.test(message)) {
-      return apiError(
-        "⚠️ Cloudflare's daily KV write limit has been reached. Feed changes and new-item tracking will resume after 00:00 UTC.",
-        503,
-      );
-    }
     console.error("Command API error:", err);
     return apiError("Internal error", 500);
   }
 }
 
 async function handleRoot(request: Request, env: Env): Promise<Response> {
-  const feedCount = (await listFeeds(env)).length;
   return new Response(
-    `RSS Feed Reader Bot is running.\nActive feeds: ${feedCount}\n\n` +
-      `Commands are handled by Telegram Serverless; polling runs on the cron trigger.`,
+    `RSS Feed Reader Bot feed engine is running.\n\n` +
+      `Commands, feeds and seen state live on Telegram Serverless; polls are ` +
+      `triggered from there (userbot scheduler) through /api/poll.`,
     { headers: { "Content-Type": "text/plain; charset=utf-8" } },
   );
 }
 
 /* ========================== Worker entry ========================== */
 
-const INTERNAL_POLL_SECRET_HEADER = "X-Internal-Poll-Secret";
-
-/**
- * A Cron Trigger on the Workers free plan is capped at 10ms of CPU per run.
- * Polling 14 RSS feeds (parsing large Persian feeds, leafing og:image pages,
- * uploading photos) needs hundreds of ms of CPU, so a cron that does that work
- * directly is always killed with outcome `exceededResources` and never sends
- * news. A normal HTTP invocation (including the Serverless `/check`) is not
- * bound by the same 10ms cap.
- *
- * Workaround: the `scheduled` handler does almost no work — it POSTs to a
- * separate dispatcher Worker (`rss-dispatcher`), which relays the request back
- * to this Worker's `/internal/check` endpoint as a normal HTTP fetch with the
- * full CPU budget, so the heavy polling actually completes. Fetching a Worker
- * on the same workers.dev zone requires the `global_fetch_strictly_public`
- * compatibility flag (set in wrangler.toml) — without it Cloudflare rejects
- * the cross-worker fetch with error 1042. See `scheduled` below.
- */
-async function handleInternalCheck(request: Request, env: Env): Promise<Response> {
-  const secret = request.headers.get(INTERNAL_POLL_SECRET_HEADER);
-  const expected = env.INTERNAL_POLL_SECRET || env.WEBHOOK_SECRET;
-  if (!expected || secret !== expected) {
-    return new Response("Unauthorized", { status: 401 });
-  }
-  const target = await getTargetChatId(env);
-  if (!target) {
-    const summary: CheckSummary = { feeds: 0, sent: 0, errors: 1 };
-    console.error("Internal check skipped: no target chat (set DEFAULT_CHAT_ID or ADMIN_USER_ID).");
-    return Response.json(summary);
-  }
-  const summary = await checkAllFeeds(env, target);
-  console.log("Internal check complete:", summary);
-  return Response.json(summary);
-}
-
 export default {
-  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
-    if (url.pathname.startsWith("/api/")) return handleCommandApi(request, env, ctx);
-    if (url.pathname === "/internal/check" && request.method === "POST") {
-      return handleInternalCheck(request, env);
-    }
+    if (url.pathname.startsWith("/api/")) return handleCommandApi(request, env);
     if (url.pathname === "/" && request.method === "GET") return handleRoot(request, env);
     return new Response("Not Found", { status: 404 });
-  },
-
-  async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
-    // The cron slot only has 10ms of CPU on the free plan (see comment above),
-    // so we must not poll the feeds in here, and cross-worker fetches on the
-    // same zone need the global_fetch_strictly_public compatibility flag
-    // (set in wrangler.toml). We ping the dispatcher Worker, which relays the
-    // request to our /internal/check endpoint as a normal HTTP fetch with the
-    // full CPU budget. Errors are reported to the logs.
-    const dispatcherUrl = env.DISPATCHER_URL;
-    if (!dispatcherUrl) {
-      console.error(
-        "Scheduled check skipped: DISPATCHER_URL is not set. Polling can't be relayed.",
-      );
-      return;
-    }
-
-    ctx.waitUntil(
-      (async () => {
-        try {
-          const res = await fetch(new URL("/trigger", dispatcherUrl).toString(), {
-            method: "POST",
-            headers: {
-              [INTERNAL_POLL_SECRET_HEADER]: env.INTERNAL_POLL_SECRET ?? "",
-              "Content-Type": "application/json",
-            },
-          });
-          if (!res.ok) {
-            console.error("Dispatch returned", res.status, await res.text().catch(() => ""));
-          }
-        } catch (err) {
-          console.error("Dispatch fetch failed:", (err as Error)?.message ?? err);
-        }
-      })(),
-    );
   },
 };

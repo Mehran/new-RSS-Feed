@@ -4,40 +4,13 @@
 name = "telegram-rss-bot"
 main = "src/index.ts"
 compatibility_date = "2024-11-01"
-# REQUIRED: lets this Worker fetch another Worker on the same workers.dev zone
-# (the cron relay -> rss-dispatcher). Without it Cloudflare rejects the
-# cross-worker fetch with error 1042.
-compatibility_flags = ["global_fetch_strictly_public"]
 
 # ---------------------------------------------------------------------------
-# Cron trigger: poll all RSS feeds every 15 minutes.
-# Adjust the schedule as needed. Format: min hour day month weekday (UTC).
-#   "*/15 * * * *"  -> every 15 minutes
-#   "*/30 * * * *"  -> every 30 minutes
-#
-# The cron handler does NOT poll feeds directly (free-plan cron is capped at
-# 10ms CPU, and a Worker cannot fetch its own URL). It relays through the
-# dispatcher Worker (rss-dispatcher, see src/dispatcher.ts + wrangler-dispatcher.toml)
-# which calls back into /internal/check with the full fetch CPU budget.
+# No cron trigger: polling is scheduled by the Telethon userbot trigger
+# (userbot/trigger.py), which sends /check to the bot. The Telegram Serverless
+# /check handler loads SQLite state, calls this Worker's /api/poll, and writes
+# the returned seen ids and feed metadata back to SQLite.
 # ---------------------------------------------------------------------------
-[triggers]
-crons = ["*/15 * * * *"]
-
-# ---------------------------------------------------------------------------
-# KV namespaces. Create each one with `wrangler kv namespace create <NAME>`
-# and paste the returned `id` here (see README for exact steps).
-# ---------------------------------------------------------------------------
-[[kv_namespaces]]
-binding = "RSS_FEEDS"      # list of RSS feed URLs + metadata
-id = "a12457813d514ea6a431f408bbfbf6be"
-
-[[kv_namespaces]]
-binding = "RSS_SEEN"       # processed article GUIDs/URLs (with TTL)
-id = "77694ed334424e84a443296e8e3763b9"
-
-[[kv_namespaces]]
-binding = "RSS_SETTINGS"   # authorized admin IDs + misc state
-id = "b8b45685f8334f0ab3eb19c06a95313a"
 
 # ---------------------------------------------------------------------------
 # Environment variables.
@@ -46,14 +19,12 @@ id = "b8b45685f8334f0ab3eb19c06a95313a"
 # Secrets MUST be set with `wrangler secret put <NAME>` (never hardcode them):
 #
 #   TELEGRAM_BOT_TOKEN  -> your bot token from @BotFather
-#   ADMIN_USER_ID       -> comma-separated authorized admin user ID(s)
+#   ADMIN_USER_ID       -> comma-separated authorized admin user ID(s),
+#                          including the userbot trigger account
 #   COMMAND_API_SECRET  -> shared secret for the /api/* routes; must match
 #                          COMMAND_API_SECRET in tgcloud/lib/config.js
-#   DEFAULT_CHAT_ID     -> (optional) channel/group/chat to post articles to;
-#                          defaults to the first ADMIN_USER_ID
-#
-# The Telegram webhook is managed by Telegram Serverless (tgcloud/); this
-# Worker no longer receives Telegram updates directly.
+#   DEFAULT_CHAT_ID     -> chat/channel/group to post articles to; defaults to
+#                          the first ADMIN_USER_ID
 #
 # Optionally set these public vars:
 #   FETCH_OG_IMAGE      -> set to "false" to DISABLE the webpage og:image fallback
@@ -61,14 +32,6 @@ id = "b8b45685f8334f0ab3eb19c06a95313a"
 #   WORKER_URL          -> this Worker's public URL (e.g.
 #                          https://telegram-rss-bot.<subdomain>.workers.dev).
 #                          Informational: the Serverless layer calls it.
-#   DISPATCHER_URL      -> URL of the rss-dispatcher Worker. The cron trigger
-#                          relays through it because a free-plan Cron Trigger is
-#                          capped at 10ms CPU and a Worker cannot fetch its own
-#                          URL (error 1042) — see src/dispatcher.ts. If unset,
-#                          scheduled polling is skipped.
-#   INTERNAL_POLL_SECRET -> shared secret for /internal/check (set with
-#                          `wrangler secret put INTERNAL_POLL_SECRET` on BOTH
-#                          this Worker and rss-dispatcher).
 # ---------------------------------------------------------------------------
 [vars]
 # Uncomment and set if you want article cards posted to a fixed chat/channel.
@@ -77,5 +40,3 @@ id = "b8b45685f8334f0ab3eb19c06a95313a"
 # FETCH_OG_IMAGE = "false"
 # This Worker's public URL (the Serverless command layer calls it):
 WORKER_URL = "https://telegram-rss-bot.reyhaneh-fc0.workers.dev"
-# Cron polling relay target (rss-dispatcher Worker):
-DISPATCHER_URL = "https://rss-dispatcher.reyhaneh-fc0.workers.dev"
