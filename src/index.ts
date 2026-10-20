@@ -793,6 +793,7 @@ async function pollFeeds(
   feeds: FeedInfo[],
   seen: string[],
   chatId?: number,
+  maxSend: number = MAX_SEND_PER_RUN,
 ): Promise<PollResult> {
   const target = getTargetChatId(env, chatId);
   if (!target) {
@@ -803,7 +804,9 @@ async function pollFeeds(
   const newSeen: string[] = [];
   const meta: MetaUpdate[] = [];
   const summary: CheckSummary = { feeds: feeds.length, sent: 0, errors: 0 };
-  let budget = MAX_SEND_PER_RUN;
+  // Callers that split a poll into several requests pass a smaller cap so the
+  // combined run still respects MAX_SEND_PER_RUN.
+  let budget = Math.min(MAX_SEND_PER_RUN, Math.max(0, Math.floor(maxSend)));
 
   for (let i = 0; i < feeds.length; i++) {
     const feed = feeds[i];
@@ -996,7 +999,15 @@ async function handleCommandApi(request: Request, env: Env): Promise<Response> {
         return apiJson({ ok: true, summary: { feeds: 0, sent: 0, errors: 0 }, seen: [], meta: [] });
       }
 
-      const result = await pollFeeds(env, feeds, seen, parseChatId(body.chatId));
+      const result = await pollFeeds(
+        env,
+        feeds,
+        seen,
+        parseChatId(body.chatId),
+        Number.isFinite(Number(body.maxSend))
+          ? Number(body.maxSend)
+          : MAX_SEND_PER_RUN,
+      );
       return apiJson({ ok: true, ...result });
     }
 

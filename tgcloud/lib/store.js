@@ -19,6 +19,15 @@ import { pollFeeds, previewFeed } from "./worker-api.js";
 const SEEN_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const SEEN_BATCH = 200;
 
+// A poll is split into small Worker calls. Asking the Worker to parse every feed
+// in one request made the Serverless invocation run long enough to be killed:
+// the cards went out, but the platform never got to persist the returned ids,
+// so the next poll sent the same articles again. Each batch is now short, and
+// the results are written as soon as it returns.
+const FEED_BATCH = 5;
+// Total cards one /check may send, spread over its batches.
+const SEND_BUDGET = 20;
+
 function bootstrapIds() {
   return String(BOOTSTRAP_ADMIN_ID ?? "")
     .split(",")
@@ -157,45 +166,70 @@ export const worker = {
     const seenRows = await db.select({ itemId: seen.itemId }).from(seen).all();
     const seenIds = seenRows.map((row) => row.itemId);
     const target = checkTarget(chatId);
+    const summary = { feeds: feedRows.length, sent: 0, errors: 0 };
 
-    const result = await pollFeeds(feedRows.map(feedInfo), seenIds, target);
+    const batches = chunks(feedRows, FEED_BATCH);
+    let budget = SEND_BUDGET;
 
-    // Persist the new ids first: the Worker only returns articles it delivered,
-    // and the caller marks them seen so the next poll does not repeat them.
-    const now = Date.now();
-    const delivered = Array.isArray(result.seen) ? result.seen.filter(Boolean) : [];
-    for (const batch of chunks(delivered, SEEN_BATCH)) {
-      await db
-        .insert(seen)
-        .values(batch.map((itemId) => ({ itemId, seenAt: now })))
-        .onConflictDoNothing({ target: seen.itemId })
-        .run();
-    }
+    for (let i = 0; i < batches.length; i++) {
+      const batch = batches[i];
+      const remainingBatches = batches.length - i;
+      const cap = budget > 0 ? Math.max(1, Math.floor(budget / remainingBatches)) : 0;
+      const now = Date.now();
 
-    for (const update of Array.isArray(result.meta) ? result.meta : []) {
-      if (!update?.url) continue;
-      await db
-        .update(feeds)
-        .set({
-          lastChecked: Number(update.lastChecked) || now,
-          lastError: update.lastError ?? null,
-          itemCount: Number.isFinite(Number(update.itemCount))
-            ? Number(update.itemCount)
-            : null,
-        })
-        .where(eq(feeds.url, update.url))
-        .run();
-    }
-
-    await db.delete(seen).where(lt(seen.seenAt, now - SEEN_TTL_MS)).run();
-
-    return (
-      result?.summary ?? {
-        feeds: feedRows.length,
-        sent: delivered.length,
-        errors: 0,
+      let result;
+      try {
+        result = await pollFeeds(batch.map(feedInfo), seenIds, target, cap);
+      } catch (err) {
+        // One slow or broken batch must not hide the rest of the feeds. Record
+        // the failure on its feeds and carry on with the next batch.
+        summary.errors += 1;
+        const message = String(err?.message ?? err).slice(0, 200);
+        for (const row of batch) {
+          await db
+            .update(feeds)
+            .set({ lastChecked: now, lastError: message })
+            .where(eq(feeds.url, row.url))
+            .run();
+        }
+        continue;
       }
-    );
+
+      // Persist immediately: the Worker has already sent these cards, so losing
+      // the ids would repeat them on the next poll.
+      const delivered = Array.isArray(result.seen) ? result.seen.filter(Boolean) : [];
+      summary.sent += delivered.length;
+      summary.errors += Number(result.summary?.errors ?? 0);
+      budget -= delivered.length;
+      seenIds.push(...delivered);
+
+      for (const ids of chunks(delivered, SEEN_BATCH)) {
+        await db
+          .insert(seen)
+          .values(ids.map((itemId) => ({ itemId, seenAt: now })))
+          .onConflictDoNothing({ target: seen.itemId })
+          .run();
+      }
+
+      for (const update of Array.isArray(result.meta) ? result.meta : []) {
+        if (!update?.url) continue;
+        await db
+          .update(feeds)
+          .set({
+            lastChecked: Number(update.lastChecked) || now,
+            lastError: update.lastError ?? null,
+            itemCount: Number.isFinite(Number(update.itemCount))
+              ? Number(update.itemCount)
+              : null,
+          })
+          .where(eq(feeds.url, update.url))
+          .run();
+      }
+    }
+
+    await db.delete(seen).where(lt(seen.seenAt, Date.now() - SEEN_TTL_MS)).run();
+
+    return summary;
   },
 
   async setAdmin(userId, add) {

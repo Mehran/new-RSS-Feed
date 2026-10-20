@@ -246,6 +246,47 @@ describe("poll", () => {
     expect(body.meta.every((m: any) => m.lastError === null)).toBe(true);
   });
 
+  it("honours a per-request maxSend cap so a poll can be split into batches", async () => {
+    const itemsPerFeed = 12;
+    const feeds = [0, 1, 2].map((i) => ({
+      url: `https://example.com/feed${i}`,
+      title: `Feed ${i}`,
+      addedAt: i,
+      lastChecked: 0,
+      lastError: null,
+      itemCount: itemsPerFeed,
+    }));
+
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input: any) => {
+      const url = String(input);
+      const match = url.match(/example\.com\/feed(\d+)$/);
+      if (match) {
+        const items = Array.from(
+          { length: itemsPerFeed },
+          (_, n) =>
+            `<item><title>${match[1]}-${n}</title><link>https://example.com/${match[1]}/${n}</link>` +
+            `<guid>https://example.com/${match[1]}/${n}</guid></item>`,
+        ).join("");
+        return new Response(
+          `<rss version="2.0"><channel><title>Feed ${match[1]}</title>${items}</channel></rss>`,
+          { status: 200, headers: { "Content-Type": "application/rss+xml" } },
+        );
+      }
+      if (url.includes("api.telegram.org")) {
+        return json({ ok: true, result: { message_id: 1 } });
+      }
+      return json({ ok: false }, 500);
+    });
+
+    const res = await post("/api/poll", { feeds, seen: [], maxSend: 3 });
+    const body: any = await res.json();
+
+    expect(body.summary.sent).toBe(3);
+    expect(telegramCalls()).toHaveLength(3);
+    // The cap is shared, so every feed in the batch is visited.
+    expect(body.meta.map((m: any) => m.url)).toEqual(feeds.map((f) => f.url));
+  });
+
   it("records a feed fetch error without failing the poll", async () => {
     mockFetch(new Response("blocked", { status: 526 }));
 

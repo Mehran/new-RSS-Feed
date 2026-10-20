@@ -223,6 +223,10 @@ The Worker must be deployed (or running under `wrangler dev`) for `/add` and
   written for all of them) even after the cap is spent — otherwise a poll with a
   long backlog spends the cap on the oldest feeds and the newest ones are never
   checked. Unsent items stay unseen and go out on a later poll.
+- `/check` drives the Worker in batches of 5 feeds and writes the returned ids
+  after each batch. Parsing every feed in one request ran the Serverless
+  invocation long enough to be killed after the cards had been sent, so the ids
+  were never persisted and the next poll repeated them.
 - `/api/poll` runs to completion under the Serverless handler and returns the
   final summary, so `/check` waits for the result instead of fire-and-forget.
 - Seen dedupe is check-then-set; the race window is negligible for one poller.

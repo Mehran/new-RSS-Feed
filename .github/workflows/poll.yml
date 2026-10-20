@@ -62,4 +62,6 @@ jobs:
           # Override with a repository variable if the bot is renamed.
           BOT_USERNAME: ${{ vars.BOT_USERNAME || 'MehranRSSReader_bot' }}
           REPLY_TIMEOUT: "180"
+          # Give a slow poll time to finish after its last card before giving up.
+          REPLY_SETTLE: "100"
         run: python userbot/trigger.py --once

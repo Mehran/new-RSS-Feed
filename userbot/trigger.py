@@ -141,7 +141,7 @@ async def wait_for_replies(
     return replies, any(text.startswith(SUMMARY_PREFIX) for text in replies)
 
 
-def report(replies: list[str], bot_username: str) -> int:
+def report(replies: list[str], bot_username: str, complete: bool) -> int:
     """Log the bot's replies and map them to a process exit code."""
     if not replies:
         log.error(
@@ -160,6 +160,18 @@ def report(replies: list[str], bot_username: str) -> int:
     if failures:
         log.error("the bot reported a failure: %s", " / ".join(failures[0].splitlines()))
         return 1
+
+    if not complete:
+        # Acknowledged but never finished: the Serverless invocation was killed
+        # (or the Worker errored silently) before it could persist the poll.
+        log.error(
+            "@%s acknowledged /check but never reported a completed check. The "
+            "poll did not finish — cards may have been sent without being "
+            "recorded, and the next poll can send them again.",
+            bot_username,
+        )
+        return 1
+
     return 0
 
 
@@ -185,9 +197,7 @@ async def run_once(
     replies, complete = await wait_for_replies(
         client, bot, min_id, timeout=timeout, settle=settle
     )
-    if replies and not complete:
-        log.warning("the bot did not send the summary line before the wait ended")
-    return report(replies, bot_username)
+    return report(replies, bot_username, complete)
 
 
 async def run_loop(client: TelegramClient, bot_username: str, interval: int) -> None:

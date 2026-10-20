@@ -43,9 +43,14 @@ export async function previewFeed(url, chatId) {
 }
 
 /**
- * Run a stateless poll on the Worker.
+ * Run a stateless poll on the Worker for one batch of feeds.
+ *
+ * `maxSend` caps the cards this call may send (the Worker's own limit is
+ * MAX_SEND_PER_RUN); the store splits a poll into batches so a single request
+ * never runs long enough to be killed mid-flight.
+ *
  * @returns {{ summary: {feeds:number,sent:number,errors:number}, seen: string[], meta: object[] }}
  */
-export async function pollFeeds(feeds, seen, chatId) {
-  return post("/poll", { feeds, seen, chatId });
+export async function pollFeeds(feeds, seen, chatId, maxSend) {
+  return post("/poll", { feeds, seen, chatId, maxSend });
 }

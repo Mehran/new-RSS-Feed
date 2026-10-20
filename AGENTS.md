@@ -71,6 +71,12 @@ never reads or writes them: every `/api/poll` request is fully parameterised.
   `meta` keeps its old `lastChecked` and is never polled again while there is a
   backlog, which is exactly how new articles stop arriving from the feeds near
   the end of the list.
+- `store.check()` splits a poll into batches of `FEED_BATCH` feeds, passes each
+  a share of the send budget via `/api/poll`'s `maxSend`, and persists the ids
+  of a batch before starting the next one. One request over every feed ran the
+  invocation long enough to be killed after the cards were sent, which lost the
+  ids and duplicated them on the next poll. Keep the batching and keep the
+  per-batch persistence.
 - The `/check` sender must be an admin. Add the userbot's numeric id to
   `BOOTSTRAP_ADMIN_ID` (`deploy.sh` fills it from `ADMIN_USER_ID`) or via
   `/admin`.
