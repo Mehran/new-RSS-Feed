@@ -178,6 +178,13 @@ put_secret DEFAULT_CHAT_ID "${DEFAULT_CHAT_ID:-}"
 
 # ---- deploy Telegram Serverless (commands + webhook) --------------------------
 log "Deploying Telegram Serverless command layer…"
+# A fresh clone (CI) has no .tgcloud snapshot, and the CLI refuses to push to a
+# bot that already has modules until the project has synced once. `fetch` only
+# refreshes that snapshot — the working directory stays the source of truth for
+# the push below.
+if ! npx tgcloud fetch >/dev/null 2>&1; then
+  warn "could not refresh the tgcloud snapshot; pushing against the local state"
+fi
 npx tgcloud push
 npx tgcloud migrate --safe
 
