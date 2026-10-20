@@ -87,6 +87,9 @@ const PAGE_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 const MAX_ITEMS_PER_FEED = 30; // only inspect the newest N items per feed
 const MAX_SEND_PER_RUN = 20; // hard cap on messages per check, protects limits
+// The cap is shared fairly between feeds (see pollFeeds): a feed never takes the
+// whole budget while others are still waiting, and every feed is still fetched
+// and reported even when the budget is already spent.
 const BODY_MAX = 300; // cleaned summary length before truncation
 const CAPTION_MAX = 950; // Telegram photo captions cap at 1024; keep a safety margin
 
@@ -802,10 +805,18 @@ async function pollFeeds(
   const summary: CheckSummary = { feeds: feeds.length, sent: 0, errors: 0 };
   let budget = MAX_SEND_PER_RUN;
 
-  for (const feed of feeds) {
-    if (budget <= 0) break;
+  for (let i = 0; i < feeds.length; i++) {
+    const feed = feeds[i];
+    // Share the send budget across the feeds that are left instead of letting
+    // the first ones consume all of it. Every feed must still be fetched and
+    // reported (lastChecked/lastError/itemCount), otherwise a poll that hits
+    // the cap leaves the tail of the list unchecked for good: with a long
+    // backlog the cap was always spent on the oldest feeds, so the newest
+    // feeds never got polled at all.
+    const remaining = feeds.length - i;
+    const share = budget > 0 ? Math.max(1, Math.floor(budget / remaining)) : 0;
     try {
-      const { sent, itemCount } = await processFeed(env, feed, target, budget, seenSet, newSeen);
+      const { sent, itemCount } = await processFeed(env, feed, target, share, seenSet, newSeen);
       summary.sent += sent;
       budget -= sent;
       meta.push({ url: feed.url, lastChecked: Date.now(), lastError: null, itemCount });

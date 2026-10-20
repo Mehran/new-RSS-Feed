@@ -201,6 +201,51 @@ describe("poll", () => {
     expect(body.seen).toEqual([]);
   });
 
+  it("checks every feed after the send budget is spent (no starvation)", async () => {
+    const feedCount = 21;
+    const itemsPerFeed = 12;
+    const feeds = Array.from({ length: feedCount }, (_, i) => ({
+      url: `https://example.com/feed${i}`,
+      title: `Feed ${i}`,
+      addedAt: i,
+      lastChecked: 0,
+      lastError: null,
+      itemCount: itemsPerFeed,
+    }));
+
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input: any) => {
+      const url = String(input);
+      const match = url.match(/example\.com\/feed(\d+)$/);
+      if (match) {
+        const items = Array.from(
+          { length: itemsPerFeed },
+          (_, n) =>
+            `<item><title>${match[1]}-${n}</title><link>https://example.com/${match[1]}/${n}</link>` +
+            `<guid>https://example.com/${match[1]}/${n}</guid></item>`,
+        ).join("");
+        return new Response(
+          `<rss version="2.0"><channel><title>Feed ${match[1]}</title>${items}</channel></rss>`,
+          { status: 200, headers: { "Content-Type": "application/rss+xml" } },
+        );
+      }
+      if (url.includes("api.telegram.org")) {
+        return json({ ok: true, result: { message_id: 1 } });
+      }
+      return json({ ok: false }, 500);
+    });
+
+    const res = await post("/api/poll", { feeds, seen: [] });
+    const body: any = await res.json();
+
+    expect(body.summary.feeds).toBe(feedCount);
+    // The cap still holds for the whole run.
+    expect(body.summary.sent).toBe(20);
+    expect(telegramCalls()).toHaveLength(20);
+    // ...but every feed is fetched and reported, so none is left unchecked.
+    expect(body.meta.map((m: any) => m.url)).toEqual(feeds.map((f) => f.url));
+    expect(body.meta.every((m: any) => m.lastError === null)).toBe(true);
+  });
+
   it("records a feed fetch error without failing the poll", async () => {
     mockFetch(new Response("blocked", { status: 526 }));
 

@@ -66,6 +66,11 @@ never reads or writes them: every `/api/poll` request is fully parameterised.
 - `/api/poll` is at-most-once by design: the Worker records an item as seen
   before sending. Failed sends are not returned in `seen`, so a retry can resend
   them; a crash after a successful send would drop them. Keep it that way.
+- `/api/poll` must still fetch and report **every** feed after `MAX_SEND_PER_RUN`
+  is spent (a fair per-feed share, not a loop `break`). A feed missing from
+  `meta` keeps its old `lastChecked` and is never polled again while there is a
+  backlog, which is exactly how new articles stop arriving from the feeds near
+  the end of the list.
 - The `/check` sender must be an admin. Add the userbot's numeric id to
   `BOOTSTRAP_ADMIN_ID` (`deploy.sh` fills it from `ADMIN_USER_ID`) or via
   `/admin`.

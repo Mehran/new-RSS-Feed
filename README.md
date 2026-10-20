@@ -96,12 +96,15 @@ export TGCLOUD_TOKEN="app<id>:<secret>"
 Deploy order matters: the Worker must expose `/api/*` before the Serverless
 handlers start receiving commands.
 
-The GitHub Actions workflow in `.github/workflows/deploy.yml` runs tests on every
-push and only deploys on a manual **Run workflow** (because deploying also
-re-points the Telegram webhook). Configure `CLOUDFLARE_API_TOKEN`,
-`CLOUDFLARE_ACCOUNT_ID`, `TELEGRAM_BOT_TOKEN`, `ADMIN_USER_ID`, `TGCLOUD_TOKEN`
-and, optionally, `COMMAND_API_SECRET` and `DEFAULT_CHAT_ID` as repository
-secrets before running it.
+The GitHub Actions workflow in `.github/workflows/deploy.yml` runs the typecheck
+and tests on every push, then deploys to Cloudflare and Telegram Serverless when
+they pass (and on a manual **Run workflow**). Configure `CLOUDFLARE_API_TOKEN`,
+`CLOUDFLARE_ACCOUNT_ID`, `TELEGRAM_BOT_TOKEN`, `TGCLOUD_TOKEN` and
+`ADMIN_USER_ID` as repository secrets; add `COMMAND_API_SECRET` and
+`DEFAULT_CHAT_ID` too, otherwise each CI run generates a fresh command secret
+(`deploy.sh` still keeps both sides in sync, but a stable value is easier to
+debug). The deploy job stops early and names the missing secrets when one is
+absent, instead of failing inside `deploy.sh` with a bare `set -u` error.
 
 ### Manual deployment
 
@@ -135,6 +138,11 @@ cd userbot && python login.py
 
 The workflow `.github/workflows/poll.yml` runs every 15 minutes. You can also
 start it manually from **Actions → Poll RSS Feeds → Run workflow**.
+
+`trigger.py --once` waits for the bot's reply and fails the run when the bot
+refuses the command, reports an error, or does not answer at all (a webhook that
+no longer reaches Telegram Serverless looks exactly like that). A green run
+therefore means the poll actually ran, not just that `/check` was sent.
 
 ---
 
@@ -210,7 +218,11 @@ The Worker must be deployed (or running under `wrangler dev`) for `/add` and
 ## Limits & notes
 
 - `MAX_SEND_PER_RUN` (20) and `MAX_ITEMS_PER_FEED` (30) keep each poll inside
-  Workers limits.
+  Workers limits. The send cap is shared between the feeds, and every feed is
+  still fetched and reported (so `lastChecked`/`lastError`/`itemCount` are
+  written for all of them) even after the cap is spent — otherwise a poll with a
+  long backlog spends the cap on the oldest feeds and the newest ones are never
+  checked. Unsent items stay unseen and go out on a later poll.
 - `/api/poll` runs to completion under the Serverless handler and returns the
   final summary, so `/check` waits for the result instead of fire-and-forget.
 - Seen dedupe is check-then-set; the race window is negligible for one poller.

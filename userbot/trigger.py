@@ -12,16 +12,30 @@ This script reuses a Telethon user session. Run it once interactively with
 config's BOOTSTRAP_ADMIN_ID (or added with /admin) or the bot will refuse the
 command.
 
+Because sending `/check` is fire-and-forget by itself, `--once` waits for the
+bot's reply and turns a refusal or a failure into a non-zero exit code. That is
+what makes a broken webhook, a missing admin entry or a Worker error show up as
+a red GitHub Actions run instead of a green one.
+
 Environment (see .env.example):
   TG_API_ID          Telegram API ID (from my.telegram.org)
   TG_API_HASH        Telegram API hash
   TG_SESSION         Telethon session name/path (default: ./rss_trigger)
+  TG_SESSION_STRING  Telethon StringSession (takes precedence; used by CI)
   BOT_USERNAME       Bot to message (default: MehranRSSReader_bot)
   INTERVAL_SECONDS   Delay between polls in --loop mode (default: 900)
+  REPLY_TIMEOUT      Seconds to wait for the bot's reply (default: 120)
+  REPLY_SETTLE       Seconds of silence that ends the wait early (default: 45)
 
 Usage:
-  python trigger.py --once      # send /check once
+  python trigger.py --once      # send /check once and report the reply
+  python trigger.py --once --no-wait
   python trigger.py --loop      # send /check every INTERVAL_SECONDS (jittered)
+
+Exit codes:
+  0  the bot reported a completed check (no errors)
+  1  the bot answered, but refused or failed the command
+  2  the bot never answered (webhook not pointed at Telegram Serverless)
 """
 
 from __future__ import annotations
@@ -32,6 +46,7 @@ import logging
 import os
 import random
 import sys
+import time
 
 from dotenv import load_dotenv
 from telethon import TelegramClient
@@ -41,6 +56,12 @@ log = logging.getLogger("rss-trigger")
 
 DEFAULT_SESSION = os.path.join(os.path.dirname(__file__), "rss_trigger")
 DEFAULT_BOT = "MehranRSSReader_bot"
+
+# The Serverless command handler acknowledges immediately, then sends the
+# summary once the Worker poll finishes (see tgcloud/lib/format.js).
+SUMMARY_PREFIX = "✅ Check complete"
+# Replies that mean the command did not do its job.
+ERROR_MARKERS = ("⛔", "⚠️", "not authorized", "Something went wrong")
 
 
 def env(name: str, default: str | None = None) -> str | None:
@@ -67,20 +88,113 @@ def load_config() -> tuple[int, str, str, str, int]:
     return api_id_int, api_hash, session, bot, interval
 
 
-async def send_check(client: TelegramClient, bot_username: str) -> None:
-    bot = await client.get_entity(bot_username)
+async def get_bot(client: TelegramClient, bot_username: str):
+    try:
+        return await client.get_entity(bot_username)
+    except Exception as exc:  # noqa: BLE001 - surface a readable hint
+        sys.exit(
+            f"Could not resolve @{bot_username}: {exc}\n"
+            "Check BOT_USERNAME; a renamed bot must be resolvable by its "
+            "current username."
+        )
+
+
+async def send_check(client: TelegramClient, bot) -> None:
     await client.send_message(bot, "/check")
 
 
-async def run_once(client: TelegramClient, bot_username: str) -> None:
-    await send_check(client, bot_username)
+async def wait_for_replies(
+    client: TelegramClient,
+    bot,
+    min_id: int,
+    *,
+    timeout: float,
+    settle: float,
+) -> tuple[list[str], bool]:
+    """Collect the bot's replies to the /check message with id > min_id.
+
+    Returns (replies, complete). `complete` is True once the summary line
+    arrives. Without a summary the wait ends after `settle` seconds of silence
+    so a slow poll is not reported as a failure.
+    """
+    replies: list[str] = []
+    last_id = min_id
+    deadline = time.monotonic() + timeout
+    quiet_since: float | None = None
+
+    while time.monotonic() < deadline:
+        messages = await client.get_messages(bot, limit=50, min_id=last_id)
+        incoming = sorted((m for m in messages if not m.out), key=lambda m: m.id)
+        if incoming:
+            for message in incoming:
+                text = (message.message or "").strip()
+                if text:
+                    replies.append(text)
+                last_id = message.id
+            quiet_since = time.monotonic()
+            if any(text.startswith(SUMMARY_PREFIX) for text in replies):
+                return replies, True
+        elif quiet_since is not None and time.monotonic() - quiet_since >= settle:
+            return replies, False
+        await asyncio.sleep(2)
+
+    return replies, any(text.startswith(SUMMARY_PREFIX) for text in replies)
+
+
+def report(replies: list[str], bot_username: str) -> int:
+    """Log the bot's replies and map them to a process exit code."""
+    if not replies:
+        log.error(
+            "no reply from @%s within the timeout. The bot received /check but "
+            "did not process it: its webhook is probably not pointed at the "
+            "Telegram Serverless project. Check with `npx tgcloud webhook` and "
+            "re-deploy with ./deploy.sh.",
+            bot_username,
+        )
+        return 2
+
+    for text in replies:
+        log.info("bot reply: %s", " / ".join(text.splitlines()))
+
+    failures = [t for t in replies if any(marker in t for marker in ERROR_MARKERS)]
+    if failures:
+        log.error("the bot reported a failure: %s", " / ".join(failures[0].splitlines()))
+        return 1
+    return 0
+
+
+async def run_once(
+    client: TelegramClient,
+    bot_username: str,
+    *,
+    wait: bool,
+    timeout: float,
+    settle: float,
+) -> int:
+    bot = await get_bot(client, bot_username)
+    # Baseline: ignore anything the bot sent earlier, so only this run's
+    # replies are reported.
+    baseline = await client.get_messages(bot, limit=1)
+    min_id = baseline[0].id if baseline else 0
+
+    await send_check(client, bot)
     log.info("sent /check to @%s", bot_username)
+    if not wait:
+        return 0
+
+    replies, complete = await wait_for_replies(
+        client, bot, min_id, timeout=timeout, settle=settle
+    )
+    if replies and not complete:
+        log.warning("the bot did not send the summary line before the wait ended")
+    return report(replies, bot_username)
 
 
 async def run_loop(client: TelegramClient, bot_username: str, interval: int) -> None:
     while True:
         try:
-            await send_check(client, bot_username)
+            bot = await get_bot(client, bot_username)
+            await send_check(client, bot)
             log.info("sent /check to @%s", bot_username)
         except Exception as exc:  # noqa: BLE001 - keep the scheduler alive
             log.warning("send failed: %s", exc)
@@ -96,6 +210,11 @@ async def main() -> int:
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--once", action="store_true", help="send /check once")
     group.add_argument("--loop", action="store_true", help="send /check forever")
+    parser.add_argument(
+        "--no-wait",
+        action="store_true",
+        help="in --once mode, do not wait for the bot's reply",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -104,6 +223,10 @@ async def main() -> int:
     )
 
     api_id, api_hash, session, bot, interval = load_config()
+    wait = args.once and not args.no_wait
+    timeout = float(env("REPLY_TIMEOUT", "120") or "120")
+    settle = float(env("REPLY_SETTLE", "45") or "45")
+
     # A StringSession (e.g. from a GitHub Actions secret) takes precedence over
     # a local SQLite session file.
     session_string = env("TG_SESSION_STRING")
@@ -118,14 +241,17 @@ async def main() -> int:
             "once to log in."
         )
 
+    code = 0
     try:
         if args.once:
-            await run_once(client, bot)
+            code = await run_once(
+                client, bot, wait=wait, timeout=timeout, settle=settle
+            )
         else:
             await run_loop(client, bot, interval)
     finally:
         await client.disconnect()
-    return 0
+    return code
 
 
 if __name__ == "__main__":

@@ -63,9 +63,17 @@ the same session at once.
 
 ```bash
 cd userbot
-python trigger.py --once            # send one /check
+python trigger.py --once            # send one /check and print the bot's reply
+python trigger.py --once --no-wait  # send without waiting for the reply
 python trigger.py --loop            # foreground loop (INTERVAL_SECONDS)
 ```
+
+`--once` waits for the bot's answer (`REPLY_TIMEOUT`, default 120s) and exits
+non-zero when the bot refuses the command (`⛔ … not authorized`), reports a
+failure (`⚠️ …`), or never answers. No answer almost always means the bot's
+webhook is not pointed at the Telegram Serverless project — check it with
+`npx tgcloud webhook` and re-deploy with `./deploy.sh`. The scheduled workflow
+relies on this, so a broken poll shows up as a failed Actions run.
 
 ## Notes
 
