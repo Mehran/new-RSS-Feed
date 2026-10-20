@@ -741,24 +741,72 @@ async function sendArticle(
   return true;
 }
 
+/** A feed that was fetched and parsed up front, or why it could not be. */
+interface LoadedFeed {
+  feed: FeedInfo;
+  items: ArticleItem[];
+  lastError: string | null;
+}
+
 /**
- * Process one feed: send unseen items (up to `budget`) and collect their ids.
+ * Fetch and parse every feed concurrently (bounded), so one slow host does not
+ * add its latency to all the others.
+ *
+ * The Serverless invocation that waits for this request has a wall-clock
+ * deadline it cannot see, and fetching 20+ feeds one after another pushed a
+ * poll past it: the cards went out, but the invocation was killed before it
+ * could persist the returned ids, so the next poll sent them again.
+ */
+async function loadFeeds(feeds: FeedInfo[], concurrency = 6): Promise<LoadedFeed[]> {
+  const loaded: LoadedFeed[] = new Array(feeds.length);
+  let next = 0;
+
+  async function worker(): Promise<void> {
+    while (true) {
+      const index = next++;
+      if (index >= feeds.length) return;
+      const feed = feeds[index];
+      try {
+        const parsed = await fetchAndParse(feed.url);
+        loaded[index] = {
+          feed,
+          items: extractItems(parsed).slice(0, MAX_ITEMS_PER_FEED),
+          lastError: null,
+        };
+      } catch (err) {
+        loaded[index] = {
+          feed,
+          items: [],
+          lastError: String((err as Error)?.message ?? err).slice(0, 200),
+        };
+      }
+    }
+  }
+
+  await Promise.all(
+    Array.from({ length: Math.max(1, Math.min(concurrency, feeds.length)) }, () => worker()),
+  );
+  return loaded;
+}
+
+/**
+ * Send the unseen items of one already-parsed feed (up to `budget`) and collect
+ * their ids.
  *
  * The seen set is modified in place and `newSeen` collects this run's ids. An
  * id is added before sending and rolled back if the send throws, so a
  * successfully delivered article is never delivered twice, while a failed send
  * is retried on the next poll.
  */
-async function processFeed(
+async function sendFeed(
   env: Env,
   feed: FeedInfo,
+  items: ArticleItem[],
   chatId: number,
   budget: number,
   seenSet: Set<string>,
   newSeen: string[],
-): Promise<{ sent: number; itemCount: number }> {
-  const parsed = await fetchAndParse(feed.url);
-  const items = extractItems(parsed).slice(0, MAX_ITEMS_PER_FEED);
+): Promise<number> {
   let sent = 0;
 
   for (const item of items) {
@@ -780,7 +828,7 @@ async function processFeed(
     }
   }
 
-  return { sent, itemCount: items.length };
+  return sent;
 }
 
 /**
@@ -808,28 +856,42 @@ async function pollFeeds(
   // combined run still respects MAX_SEND_PER_RUN.
   let budget = Math.min(MAX_SEND_PER_RUN, Math.max(0, Math.floor(maxSend)));
 
-  for (let i = 0; i < feeds.length; i++) {
-    const feed = feeds[i];
+  const loaded = await loadFeeds(feeds);
+
+  for (let i = 0; i < loaded.length; i++) {
+    const { feed, items, lastError } = loaded[i];
     // Share the send budget across the feeds that are left instead of letting
     // the first ones consume all of it. Every feed must still be fetched and
     // reported (lastChecked/lastError/itemCount), otherwise a poll that hits
     // the cap leaves the tail of the list unchecked for good: with a long
     // backlog the cap was always spent on the oldest feeds, so the newest
     // feeds never got polled at all.
-    const remaining = feeds.length - i;
+    const remaining = loaded.length - i;
     const share = budget > 0 ? Math.max(1, Math.floor(budget / remaining)) : 0;
+
+    if (lastError) {
+      summary.errors++;
+      meta.push({
+        url: feed.url,
+        lastChecked: Date.now(),
+        lastError,
+        itemCount: feed.itemCount,
+      });
+      continue;
+    }
+
     try {
-      const { sent, itemCount } = await processFeed(env, feed, target, share, seenSet, newSeen);
+      const sent = await sendFeed(env, feed, items, target, share, seenSet, newSeen);
       summary.sent += sent;
       budget -= sent;
-      meta.push({ url: feed.url, lastChecked: Date.now(), lastError: null, itemCount });
+      meta.push({ url: feed.url, lastChecked: Date.now(), lastError: null, itemCount: items.length });
     } catch (err) {
       summary.errors++;
       meta.push({
         url: feed.url,
         lastChecked: Date.now(),
         lastError: String((err as Error)?.message ?? err).slice(0, 200),
-        itemCount: feed.itemCount,
+        itemCount: items.length,
       });
     }
   }

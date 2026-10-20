@@ -24,9 +24,11 @@ const SEEN_BATCH = 200;
 // the cards went out, but the platform never got to persist the returned ids,
 // so the next poll sent the same articles again. Each batch is now short, and
 // the results are written as soon as it returns.
-const FEED_BATCH = 5;
-// Total cards one /check may send, spread over its batches.
-const SEND_BUDGET = 20;
+const FEED_BATCH = 12;
+// Total cards one /check may send, spread over its batches. Lowered from 20:
+// the invocation was killed at roughly 20-25s, and 20 cards plus their image
+// lookups came close to that on its own.
+const SEND_BUDGET = 12;
 
 function bootstrapIds() {
   return String(BOOTSTRAP_ADMIN_ID ?? "")
