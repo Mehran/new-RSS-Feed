@@ -142,7 +142,10 @@ start it manually from **Actions → Poll RSS Feeds → Run workflow**.
 `trigger.py --once` waits for the bot's reply and fails the run when the bot
 refuses the command, reports an error, or does not answer at all (a webhook that
 no longer reaches Telegram Serverless looks exactly like that). A green run
-therefore means the poll actually ran, not just that `/check` was sent.
+therefore means the poll actually ran, not just that `/check` was sent. It also
+deletes the `/check` message and the bot's acknowledgement/summary afterwards,
+and clears the ones earlier runs left behind, so the DM only shows article cards
+(`--keep-messages` keeps them for debugging; error replies are never deleted).
 
 ---
 

@@ -75,6 +75,14 @@ webhook is not pointed at the Telegram Serverless project — check it with
 `npx tgcloud webhook` and re-deploy with `./deploy.sh`. The scheduled workflow
 relies on this, so a broken poll shows up as a failed Actions run.
 
+### The chat stays clean
+
+After reporting the result, the trigger deletes its own `/check` message and the
+bot's `🔍 Checking all feeds…` / `✅ Check complete: …` replies, and sweeps those
+left over from earlier runs. The DM then only holds article cards. Error replies
+(`⚠️`, `⛔`) are left in place. Pass `--keep-messages` when debugging if you want
+to read the messages in the chat instead of the log.
+
 ## Notes
 
 - The userbot only sends `/check`; the bot replies with “🔍 Checking all feeds…”
