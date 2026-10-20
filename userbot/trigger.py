@@ -274,8 +274,12 @@ async def run_once(
         code = report(replies, bot_username, complete)
 
     # Report first (the workflow log keeps the summary), then tidy the chat.
+    # Only the trigger's own messages are removed: when the bot posts to the
+    # same chat the trigger talks to, the replies include the article cards, and
+    # those must never be deleted.
     if not keep_messages:
-        await delete_messages(client, bot, [sent.id, *(m.id for m in replies)])
+        noise = [sent.id, *(m.id for m in replies if is_trigger_message(m))]
+        await delete_messages(client, bot, noise)
 
     return code
 
