@@ -25,9 +25,12 @@ small **userbot** that sends `/check`. The schedule runs in **GitHub Actions**
 1. **Command** — Telegram delivers an update to the Serverless handler
    (`tgcloud/handlers/message.js`). It checks the sender against the SQLite admin
    list and calls the stateless Worker with a shared secret.
-2. **Schedule** — a GitHub Actions workflow runs the Telethon userbot every
-   15 minutes; the userbot sends `/check` to the bot. There is no Cloudflare
-   cron and no local scheduler.
+2. **Schedule** — a GitHub Actions workflow runs the Telethon userbot, which
+   sends `/check` to the bot every 15 minutes. Because GitHub's cron is best
+   effort (it can delay a scheduled run for hours), the job is a long-lived
+   loop that covers ~5.5 hours per invocation and queues its own successor with
+   `workflow_dispatch` before exiting. The cron is only a fallback if that
+   hand-off fails. There is no Cloudflare cron and no local scheduler.
 3. **Poll** — the Serverless `/check` handler loads feeds and seen ids from
    SQLite, then calls the Worker's `POST /api/poll`. The Worker parses each feed,
    diffs new articles against the seen set (SHA-256 of the article GUID/link,
@@ -136,16 +139,22 @@ cd userbot && python login.py
 # (TG_API_ID, TG_API_HASH, TG_SESSION_STRING)
 ```
 
-The workflow `.github/workflows/poll.yml` runs every 15 minutes. You can also
+The workflow `.github/workflows/poll.yml` polls every 15 minutes. You can also
 start it manually from **Actions → Poll RSS Feeds → Run workflow**.
 
-`trigger.py --once` waits for the bot's reply and fails the run when the bot
-refuses the command, reports an error, or does not answer at all (a webhook that
-no longer reaches Telegram Serverless looks exactly like that). A green run
-therefore means the poll actually ran, not just that `/check` was sent. It also
-deletes the `/check` message and the bot's acknowledgement/summary afterwards,
-and clears the ones earlier runs left behind, so the DM only shows article cards
-(`--keep-messages` keeps them for debugging; error replies are never deleted).
+`trigger.py --once` waits for the bot's reply and fails when the bot refuses the
+command, reports an error, or does not answer at all (a webhook that no longer
+reaches Telegram Serverless looks exactly like that). The workflow uses
+`--loop`, which runs the same verified poll every 15 minutes for up to
+`MAX_RUNTIME_SECONDS` (5h45m in CI) and then exits. The last step dispatches the
+next run via the Actions API, so the chain continues immediately instead of
+waiting for GitHub's best-effort cron; the schedule is only a fallback. That
+keeps articles flowing when GitHub delays its cron for hours. A green run
+therefore means polls actually ran, not just that `/check` was sent.
+Each poll also deletes the `/check` message and the bot's acknowledgement/summary
+afterwards, and clears the ones earlier runs left behind, so the DM only shows
+article cards (`--keep-messages` keeps them for debugging; error replies are
+never deleted).
 
 ---
 
@@ -161,9 +170,16 @@ and clears the ones earlier runs left behind, so the DM only shows article cards
 | `/admin <id>` | Grant admin | admin |
 | `/unadmin <id>` | Revoke admin | admin |
 
-The GitHub Actions workflow polls every **15 minutes**. GitHub may delay
-scheduled jobs slightly, and disables schedules after ~60 days without repo
-activity; re-enable it from the Actions tab if that happens.
+The GitHub Actions workflow polls every **15 minutes**, but GitHub only runs
+scheduled jobs on a best-effort basis: in practice they can be delayed for
+hours or dropped, which looks like "no new articles". The workflow therefore
+runs a 5h45m loop per job and, in a final step, dispatches its own successor
+with `workflow_dispatch` (allowed for `GITHUB_TOKEN` even though `push` events
+are not). The 15-minute schedule is only a fallback if that hand-off fails;
+queued runs wait behind the loop and the newest one starts when it exits.
+GitHub also disables schedules after ~60 days without repo activity and can
+stop the chain in other ways; re-run the workflow from the Actions tab if that
+happens. A manually dispatched run starts as soon as the loop's group is free.
 
 ### Write budget
 
@@ -226,14 +242,15 @@ The Worker must be deployed (or running under `wrangler dev`) for `/add` and
   written for all of them) even after the cap is spent — otherwise a poll with a
   long backlog spends the cap on the oldest feeds and the newest ones are never
   checked. Unsent items stay unseen and go out on a later poll.
-- `/check` drives the Worker in batches of 5 feeds and writes the returned ids
+- `/check` drives the Worker in batches of 12 feeds and writes the returned ids
   after each batch. Parsing every feed in one request ran the Serverless
   invocation long enough to be killed after the cards had been sent, so the ids
   were never persisted and the next poll repeated them.
 - `/api/poll` runs to completion under the Serverless handler and returns the
   final summary, so `/check` waits for the result instead of fire-and-forget.
 - Seen dedupe is check-then-set; the race window is negligible for one poller.
-  The Actions workflow's `concurrency` group avoids overlapping runs.
+  The Actions workflow's `concurrency` group avoids overlapping runs, and the
+  long-lived loop means a delayed GitHub schedule does not stop polling.
 - Telegram Serverless has no cron and no public HTTP endpoint; keep the schedule
   in GitHub Actions and the feed engine on Cloudflare.
 - Rotate `CLOUDFLARE_API_TOKEN`, the bot token, and `TGCLOUD_TOKEN` if they have

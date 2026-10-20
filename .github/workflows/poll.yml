@@ -4,11 +4,17 @@ name: Poll RSS Feeds
 # Running that trigger here keeps the schedule off any local machine.
 on:
   schedule:
+    # Fallback only. GitHub's scheduler is best effort and can delay a run for
+    # hours (or drop it), so the job below runs a long loop and dispatches its
+    # own successor. This cron restarts the chain if that dispatch ever fails.
     - cron: "*/15 * * * *"
   workflow_dispatch:
 
 permissions:
   contents: read
+  # The last step dispatches the next run through the Actions API so the poller
+  # keeps going even when GitHub's cron is late.
+  actions: write
 
 # Never run two triggers at once: the userbot session must not be used
 # concurrently, and back-to-back polls would double-send.
@@ -19,9 +25,9 @@ concurrency:
 jobs:
   poll:
     runs-on: ubuntu-latest
-    # The trigger waits for the bot's reply (REPLY_TIMEOUT) after sending /check,
-    # so this job is no longer a one-second send.
-    timeout-minutes: 10
+    # GitHub kills a job after 6 hours. The loop stops itself before that so it
+    # can disconnect cleanly; the queued successor then takes over.
+    timeout-minutes: 355
     steps:
       - uses: actions/checkout@v4
 
@@ -49,19 +55,34 @@ jobs:
       - name: Install dependencies
         run: pip install -r userbot/requirements.txt
 
-      # The trigger waits for the bot's reply. A refused /check (userbot not an
-      # admin), a Worker error, or a webhook that no longer reaches Telegram
-      # Serverless now fails this step instead of ending in a green run that
-      # silently did nothing — which is how the poller can look healthy while no
-      # articles are delivered.
-      - name: Send /check and verify the poll
+      # The loop verifies every poll: a refused /check (userbot not an admin), a
+      # Worker error, or a webhook that no longer reaches Telegram Serverless
+      # fails an iteration and is logged. One job covers ~5.5 hours, so a delayed
+      # schedule does not leave a multi-hour gap with no new articles — the
+      # symptom of relying on a short job fired by GitHub's best-effort cron.
+      - name: Poll every 15 minutes, then hand over
         env:
           TG_API_ID: ${{ secrets.TG_API_ID }}
           TG_API_HASH: ${{ secrets.TG_API_HASH }}
           TG_SESSION_STRING: ${{ secrets.TG_SESSION_STRING }}
           # Override with a repository variable if the bot is renamed.
           BOT_USERNAME: ${{ vars.BOT_USERNAME || 'MehranRSSReader_bot' }}
-          REPLY_TIMEOUT: "180"
+          INTERVAL_SECONDS: "900"
+          REPLY_TIMEOUT: "300"
           # Give a slow poll time to finish after its last card before giving up.
-          REPLY_SETTLE: "100"
-        run: python userbot/trigger.py --once
+          REPLY_SETTLE: "120"
+          # 5h45m, below the 6-hour job limit. A scheduled run is normally
+          # already queued and starts as soon as this exits.
+          MAX_RUNTIME_SECONDS: "20700"
+        run: python userbot/trigger.py --loop
+
+      # GITHUB_TOKEN is allowed to create workflow_dispatch runs (unlike push
+      # events). Queue the successor before this job exits, so the next
+      # 5h45m block starts immediately instead of waiting for the best-effort
+      # cron. !cancelled() avoids resurrecting a run the user cancelled, while
+      # still chaining after a failed loop.
+      - name: Queue the next poll job
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run poll.yml --ref "${{ github.ref_name }}"

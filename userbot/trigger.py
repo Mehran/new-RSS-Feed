@@ -26,6 +26,9 @@ Environment (see .env.example):
   INTERVAL_SECONDS   Delay between polls in --loop mode (default: 900)
   REPLY_TIMEOUT      Seconds to wait for the bot's reply (default: 120)
   REPLY_SETTLE       Seconds of silence that ends the wait early (default: 45)
+  MAX_RUNTIME_SECONDS
+                     Stop --loop after this long; 0 means forever (default: 0).
+                     CI sets it below GitHub Actions' 6-hour job limit.
 
 The messages the trigger creates are noise in the bot DM, so after reporting the
 result it deletes both its own `/check` and the bot's acknowledgement and
@@ -288,21 +291,55 @@ async def run_once(
     return code
 
 
-async def run_loop(client: TelegramClient, bot_username: str, interval: int) -> None:
+async def run_loop(
+    client: TelegramClient,
+    bot_username: str,
+    interval: int,
+    *,
+    timeout: float,
+    settle: float,
+    max_runtime: float,
+) -> None:
+    """Poll every `interval` seconds, verifying each poll like `--once`.
+
+    GitHub's scheduled workflows are best effort and are sometimes delayed for
+    hours, so CI runs this loop instead of relying on a job every 15 minutes:
+    one invocation covers a long stretch, and the workflow restarts it.
+    `max_runtime` stops before GitHub's 6-hour job limit so Telethon can
+    disconnect cleanly and the next run can take over.
+    """
+    started = time.monotonic()
     while True:
+        remaining_before = max_runtime - (time.monotonic() - started)
+        # Do not start a poll that could outlive the runtime budget: waiting for
+        # the reply can take minutes, and GitHub kills the job at 6 hours.
+        if max_runtime > 0 and remaining_before < 10 * 60:
+            log.info("reached max runtime (%ss); stopping", int(max_runtime))
+            return
+
+        iteration_started = time.monotonic()
         try:
-            bot = await get_bot(client, bot_username)
-            # Sweep the previous iteration's /check and summary so the chat stays
-            # readable; the messages of this iteration are cleaned up next time.
-            await cleanup_previous(client, bot)
-            await send_check(client, bot)
-            log.info("sent /check to @%s", bot_username)
+            code = await run_once(
+                client,
+                bot_username,
+                wait=True,
+                timeout=timeout,
+                settle=settle,
+                keep_messages=False,
+            )
+            if code:
+                log.warning("the check finished with exit code %s", code)
         except Exception as exc:  # noqa: BLE001 - keep the scheduler alive
-            log.warning("send failed: %s", exc)
-        # Jitter avoids a thundering herd if several triggers are restarted
-        # together and keeps the poll cadence from drifting into a fixed beat.
-        delay = max(60, interval + random.randint(-30, 30))
-        log.info("next check in %s seconds", delay)
+            log.warning("check failed: %s", exc)
+
+        # Keep a stable cadence: sleep out the rest of the interval, minus the
+        # time the poll itself took. Jitter avoids a fixed beat.
+        elapsed = time.monotonic() - iteration_started
+        delay = max(60.0, interval - elapsed + random.randint(-30, 30))
+        if max_runtime > 0:
+            remaining = max_runtime - (time.monotonic() - started)
+            delay = min(delay, max(0.0, remaining))
+        log.info("next check in %s seconds", int(delay))
         await asyncio.sleep(delay)
 
 
@@ -332,6 +369,7 @@ async def main() -> int:
     wait = args.once and not args.no_wait
     timeout = float(env("REPLY_TIMEOUT", "120") or "120")
     settle = float(env("REPLY_SETTLE", "45") or "45")
+    max_runtime = float(env("MAX_RUNTIME_SECONDS", "0") or "0")
 
     # A StringSession (e.g. from a GitHub Actions secret) takes precedence over
     # a local SQLite session file.
@@ -359,7 +397,14 @@ async def main() -> int:
                 keep_messages=args.keep_messages,
             )
         else:
-            await run_loop(client, bot, interval)
+            await run_loop(
+                client,
+                bot,
+                interval,
+                timeout=timeout,
+                settle=settle,
+                max_runtime=max_runtime,
+            )
     finally:
         await client.disconnect()
     return code

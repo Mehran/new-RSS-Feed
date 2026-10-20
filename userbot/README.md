@@ -10,8 +10,13 @@ tiny Telethon userbot sends `/check` to the bot on a schedule. The Serverless
 3. the Worker fetches/parses the feeds and sends article cards;
 4. the handler writes the returned seen ids and feed metadata back to SQLite.
 
-The schedule runs in **GitHub Actions** (`.github/workflows/poll.yml`) every
-15 minutes, so no local machine has to stay on.
+The trigger runs in **GitHub Actions** (`.github/workflows/poll.yml`), so no
+local machine has to stay on. It polls every 15 minutes from a long-lived loop:
+GitHub's `schedule` is best effort and can delay a job for hours, so one job
+covers ~5.5 hours and then dispatches its own successor with `workflow_dispatch`
+(which `GITHUB_TOKEN` is allowed to do). The 15-minute cron is only a fallback.
+This is why the workflow is not a short `--once` job despite the 15-minute
+interval.
 
 ## One-time setup
 
@@ -53,8 +58,15 @@ Never commit the session string or the `.session` file.
 
 ### 3. Run it
 
-The workflow runs automatically every 15 minutes. To run it immediately:
+The workflow starts automatically (subject to GitHub's best-effort scheduler)
+and polls every 15 minutes while its job is alive. To start it immediately:
 GitHub → **Actions → Poll RSS Feeds → Run workflow**.
+
+In CI the job runs `python trigger.py --loop` with `MAX_RUNTIME_SECONDS=20700`
+(5h45m), keeping it under GitHub's 6-hour job limit, then a final step queues
+the next run. Each iteration uses the same verified path as `--once`; a refusal
+or timeout is logged and the loop continues instead of leaving the bot
+unmonitored for hours.
 
 ## Manual run (optional)
 
@@ -72,8 +84,10 @@ python trigger.py --loop            # foreground loop (INTERVAL_SECONDS)
 non-zero when the bot refuses the command (`⛔ … not authorized`), reports a
 failure (`⚠️ …`), or never answers. No answer almost always means the bot's
 webhook is not pointed at the Telegram Serverless project — check it with
-`npx tgcloud webhook` and re-deploy with `./deploy.sh`. The scheduled workflow
-relies on this, so a broken poll shows up as a failed Actions run.
+`npx tgcloud webhook` and re-deploy with `./deploy.sh`. The workflow's loop uses
+the same checks for every poll, so a broken poll is visible in the job log
+instead of failing silently. Set `MAX_RUNTIME_SECONDS` to stop `--loop`
+automatically (0 means run forever).
 
 ### The chat stays clean
 

@@ -15,11 +15,14 @@ A Telegram RSS feed reader bot with two deployments:
 Telegram Serverless has **no cron and no public HTTP endpoint** — its endpoints
 are only callable by a Telegram user inside the bot's Mini App, so there is no
 server-to-server API. Polling is therefore scheduled by a Telethon **userbot**
-(`userbot/`) that sends `/check`; the schedule runs in **GitHub Actions**
-(`.github/workflows/poll.yml`), so no local machine needs to stay on. The
-Serverless handler drives the poll and persists the results. Do not try to move
-the feed-fetching/sending engine into `tgcloud/`, and do not try to make the
-Worker call Serverless or own state.
+(`userbot/`) that sends `/check`; the trigger runs in **GitHub Actions**
+(`.github/workflows/poll.yml`), so no local machine needs to stay on. GitHub's
+`schedule` is best effort and can delay a run for hours, so the job runs
+`trigger.py --loop` for ~5.5 hours and then dispatches its own successor with
+`workflow_dispatch` (allowed for `GITHUB_TOKEN`; the cron is only a fallback).
+The Serverless handler drives the poll and persists the results. Do not try to
+move the feed-fetching/sending engine into `tgcloud/`, and do not try to make
+the Worker call Serverless or own state.
 
 Feeds, seen items and admins live only in Telegram Serverless SQLite. The Worker
 never reads or writes them: every `/api/poll` request is fully parameterised.
@@ -84,6 +87,12 @@ never reads or writes them: every `/api/poll` request is fully parameterised.
   `[[kv_namespaces]]` block, `deploy.sh` refuses to run.
 - The Worker must not grow state or a cron: the whole point of the split is that
   Telegram Serverless owns state and scheduling.
+- Do not turn the poll workflow back into a short `--once` job on a 15-minute
+  cron. GitHub delays or drops scheduled runs (observed gaps of hours), which
+  stops article delivery even though every run that does start is green. Keep
+  the long `--loop` job, the `workflow_dispatch` self-hand-off, and
+  `MAX_RUNTIME_SECONDS` below the 6-hour job limit. The workflow needs
+  `actions: write` for the hand-off.
 
 ## Commands
 
