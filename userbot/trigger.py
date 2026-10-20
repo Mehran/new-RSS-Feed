@@ -67,8 +67,10 @@ DEFAULT_BOT = "MehranRSSReader_bot"
 # summary once the Worker poll finishes (see tgcloud/lib/format.js).
 ACK_PREFIX = "🔍 Checking all feeds"
 SUMMARY_PREFIX = "✅ Check complete"
-# Replies that mean the command did not do its job.
-ERROR_MARKERS = ("⛔", "⚠️", "not authorized", "Something went wrong")
+# Replies that mean the command did not do its job. The command handler sends
+# these as a single line starting with the marker; article cards are multi-line,
+# so a card that happens to contain "⚠️" is not mistaken for a failure.
+ERROR_PREFIXES = ("⛔", "⚠️")
 
 
 def env(name: str, default: str | None = None) -> str | None:
@@ -222,7 +224,9 @@ def report(replies: list, bot_username: str, complete: bool) -> int:
     for text in texts:
         log.info("bot reply: %s", " / ".join(text.splitlines()))
 
-    failures = [t for t in texts if any(marker in t for marker in ERROR_MARKERS)]
+    failures = [
+        t for t in texts if "\n" not in t and t.startswith(ERROR_PREFIXES)
+    ]
     if failures:
         log.error("the bot reported a failure: %s", " / ".join(failures[0].splitlines()))
         return 1
